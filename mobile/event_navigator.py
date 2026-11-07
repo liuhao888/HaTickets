@@ -44,7 +44,6 @@ if TYPE_CHECKING:
     from mobile.page_probe import PageProbe
 
 logger = get_logger(__name__)
-_monotonic = time.monotonic
 
 
 # issue #51+#50 搜索/标题匹配阈值（离线校准，调参原则：负向信号——城市/年份
@@ -109,9 +108,7 @@ def _enumerate_sessions_from_xml(xml_str: str) -> List[Dict[str, Any]]:
     for date_node in panel.iter("node"):
         if date_node.get("resource-id") != _SESSION_DATE_RESOURCE_ID:
             continue
-        clickable = _find_clickable_ancestor(parent_map, date_node)
-        if clickable is None:
-            clickable = date_node
+        clickable = _find_clickable_ancestor(parent_map, date_node) or date_node
         texts = [
             (desc.get("text") or "").strip()
             for desc in clickable.iter("node")
@@ -152,7 +149,6 @@ def select_session(
     date: Optional[str] = None,
     city: Optional[str] = None,
     fallback_index: Optional[int] = None,
-    strict: bool = False,
 ) -> int:
     """Pick a session on the multi-session SKU panel.
 
@@ -170,9 +166,6 @@ def select_session(
         city: City keyword expected to appear in the card text.
         fallback_index: Zero-based card index used when neither ``date``
             nor ``city`` resolves a unique candidate.
-        strict: Require the configured date/city criteria to identify exactly
-            one card.  When true, no date-only or index fallback is allowed
-            after a date+city mismatch.
 
     Returns:
         The zero-based index of the selected session.
@@ -206,47 +199,14 @@ def select_session(
             "未发现可选场次（sku_panel_dates 内未找到 tv_date 节点）"
         )
 
+    logger.info("场次列表（共 %d 个）:", len(cards))
+    for card in cards:
+        label = (card.get("text") or card.get("date") or "(未识别)").strip()
+        logger.info("  [%s] %s", card.get("index"), label)
+
     chosen: Optional[Dict[str, Any]] = None
 
-    if strict:
-        if date and city:
-            matches = [
-                c
-                for c in cards
-                if _date_equals(c["date"], date) and city in c["text"]
-            ]
-            criteria = f"date={date} + city={city}"
-        elif date:
-            matches = [c for c in cards if _date_equals(c["date"], date)]
-            criteria = f"date={date}"
-        elif city:
-            matches = [c for c in cards if city in c["text"]]
-            criteria = f"city={city}"
-        else:
-            _emit_err("select_session.strict_no_criteria", total=len(cards))
-            raise SessionNotFoundError("正式模式未配置 date/city，无法确认目标场次")
-
-        if len(matches) != 1:
-            _emit_err(
-                "select_session.strict_not_unique",
-                matches=len(matches),
-                criteria=criteria,
-            )
-            raise SessionNotFoundError(
-                f"{criteria} 命中 {len(matches)} 条场次，正式模式无法唯一确认"
-            )
-        chosen = matches[0]
-        log_event(
-            logger,
-            "session_selected",
-            match="strict",
-            date=date,
-            city=city,
-            index=chosen["index"],
-            total=len(cards),
-        )
-
-    if chosen is None and date and city:
+    if date and city:
         matches = [
             c for c in cards if _date_equals(c["date"], date) and city in c["text"]
         ]
@@ -329,10 +289,6 @@ class EventNavigator:
         # prompt_runner 通过 DamaiBot._last_failed_candidates 只读 property
         # 读取，用于失败文案中列出 top-5 候选引导用户补全标题）
         self._last_failed_candidates: list = []
-        # Formal submission may only consume identity observed on the current
-        # detail/SKU/session page.  Search-card and item-resolver candidates are
-        # intentionally excluded from this proof.
-        self._last_formal_event_identity: Optional[Dict[str, str]] = None
 
     def set_bot(self, bot) -> None:
         """Set the DamaiBot reference (breaks circular init dependency)."""
@@ -340,22 +296,13 @@ class EventNavigator:
 
     def navigate_to_target_event(self, initial_probe=None) -> bool:
         """Navigate from current page to the target event detail page."""
-        if getattr(self._config, "probe_only", False) is True:
-            logger.warning(
-                "probe_only 为只读模式，未执行自动搜索或页面导航"
-            )
-            return False
         if not self._config.auto_navigate:
             logger.warning("auto_navigate 未启用")
             return False
 
         probe = initial_probe or self._probe.probe_current_page(fast=True)
         if probe["state"] == "detail_page":
-            if self._bot is None:
-                return True
-            if self._bot._current_page_matches_target(probe):
-                return True
-            logger.warning("当前详情页不是目标演出，重新执行目标导航")
+            return True
 
         # Delegate to DamaiBot's real navigation
         if self._bot is not None:
@@ -455,45 +402,8 @@ class EventNavigator:
 
         return False
 
-    def _formal_title_matches_target(self, title_text):
-        """Require normalized exact title identity for authorised submission."""
-        normalized_title = normalize_text(title_text)
-        configured_title = getattr(self._config, "target_title", None)
-        normalized_target = (
-            normalize_text(configured_title)
-            if isinstance(configured_title, str)
-            else ""
-        )
-        if not normalized_target:
-            log_event(
-                logger,
-                "formal_target_title_missing",
-                level=logging.WARNING,
-            )
-            return False
-        return bool(normalized_title and normalized_title == normalized_target)
-
-    def _record_formal_event_identity(
-        self, *, observed_title: str, observed_venue: str = ""
-    ) -> None:
-        """Keep the exact page observation for the orchestrator proof chain."""
-        configured_title = getattr(self._config, "target_title", None)
-        configured_venue = getattr(self._config, "target_venue", None)
-        self._last_formal_event_identity = {
-            "target_title": normalize_text(
-                configured_title if isinstance(configured_title, str) else ""
-            ),
-            "observed_title": observed_title.strip(),
-            "observed_title_normalized": normalize_text(observed_title),
-            "target_venue": normalize_text(
-                configured_venue if isinstance(configured_venue, str) else ""
-            ),
-            "observed_venue": observed_venue.strip(),
-            "observed_venue_normalized": normalize_text(observed_venue),
-        }
-
     def _current_page_matches_target(self, page_probe, clicked_title=None):
-        """Check if the current detail/SKU/session page points at the target event.
+        """Check if the current detail/sku page already points at the expected event.
 
         Args:
             page_probe: 页面状态探测结果。
@@ -502,32 +412,7 @@ class EventNavigator:
                 短标题/截断差异）。``None`` 时保持旧行为。
         """
         bot = self._bot
-        formal_commit = (
-            getattr(self._config, "if_commit_order", False) is True
-        )
-        if formal_commit:
-            # Never let a prior successful observation survive a later failed
-            # state, unreadable page, or identity check.
-            self._last_formal_event_identity = None
-        if page_probe["state"] not in {
-            "detail_page",
-            "sku_page",
-            "session_picker",
-        }:
-            return False
-
-        if formal_commit and not normalize_text(
-            self._config.target_title
-            if isinstance(
-                getattr(self._config, "target_title", None), str
-            )
-            else ""
-        ):
-            log_event(
-                logger,
-                "formal_target_title_missing",
-                level=logging.WARNING,
-            )
+        if page_probe["state"] not in {"detail_page", "sku_page"}:
             return False
 
         if (
@@ -537,67 +422,7 @@ class EventNavigator:
         ):
             return True
 
-        observed_title = page_probe.get("observed_title")
-        detail_title = (
-            observed_title.strip()
-            if isinstance(observed_title, str) and observed_title.strip()
-            else bot._get_detail_title_text()
-        )
-        target_venue = (
-            normalize_text(self._config.target_venue)
-            if isinstance(
-                getattr(self._config, "target_venue", None), str
-            )
-            else ""
-        )
-        detail_venue_loaded = False
-        detail_venue = ""
-        detail_venue_text = ""
-
-        def venue_allows_title_match():
-            """Apply configured venue evidence without another hot-path scan."""
-            nonlocal detail_venue_loaded, detail_venue, detail_venue_text
-            if not target_venue:
-                return True
-            if not detail_venue_loaded:
-                detail_venue_loaded = True
-                observed_venue = page_probe.get("observed_venue")
-                detail_venue_text = (
-                    observed_venue
-                    if isinstance(observed_venue, str)
-                    and observed_venue.strip()
-                    else bot._get_detail_venue_text() or ""
-                )
-                detail_venue = normalize_text(detail_venue_text)
-            if detail_venue and (
-                (formal_commit and target_venue == detail_venue)
-                or (
-                    not formal_commit
-                    and (
-                        target_venue in detail_venue
-                        or detail_venue in target_venue
-                    )
-                )
-            ):
-                return True
-            if detail_venue:
-                log_event(
-                    logger,
-                    "target_venue_mismatch",
-                    level=logging.WARNING,
-                    expected_venue=target_venue,
-                    observed_venue=detail_venue,
-                )
-                return False
-            if formal_commit:
-                log_event(
-                    logger,
-                    "target_venue_unconfirmed",
-                    level=logging.WARNING,
-                    expected_venue=target_venue,
-                )
-                return False
-            return True
+        detail_title = bot._get_detail_title_text()
 
         if clicked_title:
             if not detail_title:
@@ -616,31 +441,10 @@ class EventNavigator:
                     level=logging.WARNING,
                     clicked_title=clicked_title,
                 )
-                if formal_commit:
-                    # A matching venue is not unique evidence: one venue can
-                    # host multiple projects on the same day.  Formal mode
-                    # therefore requires readable title evidence as well.
-                    log_event(
-                        logger,
-                        "target_identity_unconfirmed",
-                        level=logging.WARNING,
-                        clicked_title=clicked_title,
-                        reason="detail_title_empty",
-                    )
-                    return False
                 # 兜底 1：场馆文案可读且与目标场馆一致 → 视为已验证。
                 target_venue = normalize_text(self._config.target_venue or "")
                 if target_venue:
-                    if not detail_venue_loaded:
-                        detail_venue_loaded = True
-                        observed_venue = page_probe.get("observed_venue")
-                        detail_venue_text = (
-                            observed_venue
-                            if isinstance(observed_venue, str)
-                            and observed_venue.strip()
-                            else bot._get_detail_venue_text() or ""
-                        )
-                        detail_venue = normalize_text(detail_venue_text)
+                    detail_venue = normalize_text(bot._get_detail_venue_text() or "")
                     if detail_venue and (
                         target_venue in detail_venue or detail_venue in target_venue
                     ):
@@ -653,35 +457,13 @@ class EventNavigator:
                         return True
                 # 兜底 2：标题「读不到」≠「不一致」。clicked_title 已经过搜索卡
                 # 评分 + 城市冲突否决筛选，此处 reject 会将正确条目加入黑名单
-                # 造成死循环（2026-07-11 真机实测）。仅非正式模式带 WARNING
-                # 放行；正式模式在上面 fail closed，不能把搜索卡片当成最终证据。
+                # 造成死循环（2026-07-11 真机实测）。带 WARNING 放行，错误页面
+                # 风险由下游 SKU 场次/票档匹配兜底。
                 log_event(
                     logger,
                     "detail_title_unverified_accept",
                     level=logging.WARNING,
                     clicked_title=clicked_title,
-                )
-                return True
-            if formal_commit:
-                if not self._formal_title_matches_target(detail_title):
-                    log_event(
-                        logger,
-                        "formal_target_title_mismatch",
-                        level=logging.WARNING,
-                        detail_title=detail_title,
-                        clicked_title=clicked_title,
-                    )
-                    return False
-                if not venue_allows_title_match():
-                    return False
-                observed_venue = detail_venue_text
-                if not observed_venue:
-                    snapshot_venue = page_probe.get("observed_venue")
-                    if isinstance(snapshot_venue, str):
-                        observed_venue = snapshot_venue
-                self._record_formal_event_identity(
-                    observed_title=detail_title,
-                    observed_venue=observed_venue,
                 )
                 return True
             else:
@@ -702,26 +484,10 @@ class EventNavigator:
                         match="clicked_card",
                         similarity=round(similarity, 3),
                     )
-                    return venue_allows_title_match()
-
-        if formal_commit:
-            if not self._formal_title_matches_target(detail_title):
-                return False
-            if not venue_allows_title_match():
-                return False
-            observed_venue = detail_venue_text
-            if not observed_venue:
-                snapshot_venue = page_probe.get("observed_venue")
-                if isinstance(snapshot_venue, str):
-                    observed_venue = snapshot_venue
-            self._record_formal_event_identity(
-                observed_title=detail_title,
-                observed_venue=observed_venue,
-            )
-            return True
+                    return True
 
         if bot._title_matches_target(detail_title):
-            return venue_allows_title_match()
+            return True
 
         if clicked_title:
             log_event(
@@ -811,8 +577,11 @@ class EventNavigator:
                 except Exception:
                     return False
 
-            if not bot._press_keycode_safe(66, context="提交搜索关键词"):
-                return False
+            # 华为/百度等输入法上 keycode 66 不触发搜索（issue #61 真机验证）：
+            # 优先点击搜索框下方的关键词联想行，失败再回退 ENTER。
+            if not self._tap_keyword_suggestion():
+                if not bot._press_keycode_safe(66, context="提交搜索关键词"):
+                    return False
             if bot._has_element(ANDROID_UIAUTOMATOR, 'new UiSelector().text("演出")'):
                 bot.smart_wait_and_click(
                     ANDROID_UIAUTOMATOR,
@@ -821,18 +590,43 @@ class EventNavigator:
                 )
                 time.sleep(0.1)
             try:
-                deadline = _monotonic() + 3.5
-                while _monotonic() < deadline:
+                deadline = time.time() + 3.5
+                while time.time() < deadline:
                     if bot._find_all(By.ID, "cn.damai:id/ll_search_item"):
                         break
                     time.sleep(0.04)
                 else:
                     raise TimeoutException("搜索结果加载超时")
             except TimeoutException:
-                logger.warning("搜索结果加载超时")
+                if bot._has_element(By.ID, "cn.damai:id/search_result_film_card_buy_btn"):
+                    logger.warning(
+                        "搜索结果为电影/影视内容，自动购票仅支持演出类结果，请检查 keyword"
+                    )
+                else:
+                    logger.warning("搜索结果加载超时")
                 return False
 
         return True
+
+    def _tap_keyword_suggestion(self):
+        """点击搜索框下方的关键词联想行以提交搜索（issue #61）。
+
+        9.x 版本搜索编辑页在输入关键词后会出现以 ``tv_word`` 展示的联想行，
+        点击它等效于提交搜索；键盘为自绘控件时 ENTER 不生效，此路是主路径。
+        resource-id 查找必须走 By.ID 通道（u2 无法解析 UiSelector 字符串中的
+        ``resourceId()``，真机验证）。
+        """
+        bot = self._bot
+        try:
+            selector = bot._find(By.ID, "cn.damai:id/tv_word")
+            if not bot._selector_exists(selector):
+                return False
+            bot._click_element_center(selector)
+            logger.info("已点击关键词联想行提交搜索")
+            return True
+        except Exception as e:
+            logger.warning(f"点击关键词联想行失败，回退 ENTER 提交: {e}")
+            return False
 
     def _score_search_result(self, title_text, venue_text, city_text=None):
         """Score a search result against the configured target.
@@ -945,6 +739,46 @@ class EventNavigator:
             return
         bot.d.swipe(540, 1770, 540, 520, duration=0.3)
 
+    def _find_tour_station_candidate(self, result_cards):
+        """在巡演聚合卡场景下找与配置城市匹配的站点行（issue #61）。
+
+        巡演卡以 ``tv_project_tourName`` 标识（如"谢霆锋进化演唱会，以下4个城市
+        巡演中"），站点行 ``tv_city`` 展开在卡外同屏容器中，需点击站点行才能
+        进入城市场次的详情页。返回 ``(站点节点, 巡演标题)``；无巡演卡返回
+        ``(None, None)``；有巡演卡但城市不匹配时返回 ``(None, 巡演标题)`` 并
+        列出可用站点——绝不能点击错误城市，那是另一场演出。
+        """
+        bot = self._bot
+        tour_title = None
+        for card in result_cards:
+            name = bot._safe_element_text(
+                card, By.ID, "cn.damai:id/tv_project_tourName"
+            )
+            if name:
+                tour_title = name
+                break
+        if tour_title is None:
+            return None, None
+
+        wanted = normalize_text((self._config.city or "").strip())
+        available = []
+        for node in bot._find_all(By.ID, "cn.damai:id/tv_city"):
+            city_text = bot._read_element_text(node).strip()
+            if not city_text:
+                continue
+            available.append(city_text)
+            normalized_city = normalize_text(city_text.replace("站", "").strip())
+            if wanted and (wanted in normalized_city or normalized_city in wanted):
+                logger.info("巡演卡命中目标城市 %s，点击站点行", city_text)
+                return node, tour_title
+        logger.warning(
+            "巡演卡《%s》未找到匹配城市 %s，可用站点: %s",
+            tour_title,
+            self._config.city or "(未配置)",
+            "/".join(dict.fromkeys(available)) or "未知",
+        )
+        return None, tour_title
+
     def _open_target_from_search_results(
         self, max_scrolls=2, max_results=5, return_details=False
     ):
@@ -1012,16 +846,18 @@ class EventNavigator:
                         best_match = card
                         best_title = title_text
 
+                click_node, click_title = None, None
                 if best_match is not None and best_score >= _CLICK_SCORE_THRESHOLD:
-                    # A result-card tap may open a different project, even when
-                    # the visible title looked similar.  Purge every page scope
-                    # before crossing that boundary so no coordinate or
-                    # same-snapshot price proof can leak from the prior event.
-                    bot._invalidate_all_hot_cache(
-                        reason="search_result_opened",
+                    click_node, click_title = best_match, best_title
+                if click_node is None:
+                    tour_node, tour_title = self._find_tour_station_candidate(
+                        result_cards
                     )
-                    bot._verified_price_selection = None
-                    bot._click_element_center(best_match)
+                    if tour_node is not None:
+                        click_node, click_title = tour_node, tour_title
+
+                if click_node is not None:
+                    bot._click_element_center(click_node)
                     detail_probe = bot.wait_for_page_state(
                         {"detail_page", "sku_page"}, timeout=5.5
                     )
@@ -1029,7 +865,7 @@ class EventNavigator:
                         "detail_page",
                         "sku_page",
                     } and bot._current_page_matches_target(
-                        detail_probe, clicked_title=best_title
+                        detail_probe, clicked_title=click_title
                     ):
                         collected.sort(key=lambda item: item["score"], reverse=True)
                         details = {
@@ -1041,7 +877,7 @@ class EventNavigator:
                     logger.warning(
                         "已进入详情页，但标题与目标演出不一致，返回搜索结果继续尝试"
                     )
-                    rejected_titles.add(normalize_text(best_title))
+                    rejected_titles.add(normalize_text(click_title))
                     if not bot._press_keycode_safe(4, context="返回搜索列表"):
                         break
                     time.sleep(0.25)
@@ -1161,12 +997,6 @@ class EventNavigator:
         self, keyword_candidates, initial_probe=None, search_scrolls=1, result_limit=5
     ):
         """Try multiple keywords, collect candidate summaries, and open the best match."""
-        if getattr(self._config, "probe_only", False) is True:
-            logger.warning(
-                "probe_only 为只读观察模式，discover_target_event 未执行返回、"
-                "搜索、输入、滚动或结果点击"
-            )
-            return None
         bot = self._bot
         bot._last_discovery_step_timings = []
         self._last_failed_candidates = []
@@ -1243,11 +1073,6 @@ class EventNavigator:
                     )
                     continue
 
-            if normalize_text(self._config.keyword) != normalized_keyword:
-                bot._invalidate_all_hot_cache(
-                    reason="target_keyword_changed",
-                )
-                bot._verified_price_selection = None
             self._config.keyword = keyword
             logger.info(f"尝试搜索关键词: {keyword}")
             if not bot._submit_search_keyword():

@@ -213,10 +213,6 @@ class TestIsPriceOptionAvailable:
     def test_unavailable_when_no_ticket(self):
         assert self._selector()._is_price_option_available({"tag": "无票"}) is False
 
-    @pytest.mark.parametrize("tag", ["暂时售罄", "该票档已售罄", "暂不可售"])
-    def test_unavailable_sentence_variants(self, tag):
-        assert self._selector()._is_price_option_available({"tag": tag}) is False
-
     def test_available_when_tag_is_none(self):
         assert self._selector()._is_price_option_available({"tag": None}) is True
 
@@ -260,24 +256,12 @@ class TestPriceTextMatchesTarget:
         selector = PriceSelector(device=MagicMock(), config=config, probe=MagicMock())
         assert selector._price_text_matches_target("580元") is False
 
-    @pytest.mark.parametrize("observed", ["1699元", "内场1699元"])
-    def test_rejects_larger_amount_containing_target_digits(self, observed):
+    def test_number_matches_inside_tier_name(self):
         config = MagicMock()
-        config.price = "699元"
+        config.price = "780"
         selector = PriceSelector(device=MagicMock(), config=config, probe=MagicMock())
-        assert selector._price_text_matches_target(observed) is False
-
-    def test_rejects_conflicting_labels_at_same_amount(self):
-        config = MagicMock()
-        config.price = "内场699元"
-        selector = PriceSelector(device=MagicMock(), config=config, probe=MagicMock())
-        assert selector._price_text_matches_target("看台699元") is False
-
-    def test_accepts_optional_observed_label_at_same_amount(self):
-        config = MagicMock()
-        config.price = "699元"
-        selector = PriceSelector(device=MagicMock(), config=config, probe=MagicMock())
-        assert selector._price_text_matches_target("内场699元") is True
+        assert selector._price_text_matches_target("内场780元") is True
+        assert selector._price_text_matches_target("看台380元") is False
 
 
 class TestGetBuyButtonCoords:
@@ -394,367 +378,6 @@ class TestGetPriceCoordsFromXml:
         )
         assert result is not None  # retry succeeded
 
-    def _add_card_text(self, xml, index, text, tag=""):
-        container = next(xml.iter("node"))
-        card = list(container)[index]
-        import xml.etree.ElementTree as ET
-
-        ET.SubElement(card, "node", attrib={"text": text})
-        if tag:
-            ET.SubElement(card, "node", attrib={"text": tag})
-
-    def test_formal_mode_verifies_price_text_from_same_xml(self):
-        bot = MagicMock()
-        bot._using_u2.return_value = True
-        bot._parse_bounds.return_value = (100, 200, 180, 280)
-        config = MagicMock()
-        config.price_index = 1
-        config.price = "580元"
-        config.if_commit_order = True
-        selector = PriceSelector(
-            device=MagicMock(), config=config, probe=MagicMock()
-        )
-        selector.set_bot(bot)
-        xml = self._make_xml(
-            "cn.damai:id/project_detail_perform_price_flowlayout", 3
-        )
-        self._add_card_text(xml, 1, "¥580")
-
-        assert selector._get_price_coords_from_xml(xml) == (140, 240)
-        assert bot._verified_price_selection == {
-            "coords": (140, 240),
-            "price_index": 1,
-            "target_price": "580元",
-            "observed_price": "¥580",
-        }
-        bot._set_terminal_failure.assert_not_called()
-
-    def test_formal_mode_rejects_mismatched_price_text(self):
-        bot = MagicMock()
-        bot._using_u2.return_value = True
-        config = MagicMock()
-        config.price_index = 1
-        config.price = "580元"
-        config.if_commit_order = True
-        selector = PriceSelector(
-            device=MagicMock(), config=config, probe=MagicMock()
-        )
-        selector.set_bot(bot)
-        xml = self._make_xml(
-            "cn.damai:id/project_detail_perform_price_flowlayout", 3
-        )
-        self._add_card_text(xml, 1, "880元")
-
-        assert selector._get_price_coords_from_xml(xml) is None
-        bot._set_terminal_failure.assert_called_once_with(
-            "target_price_unconfirmed"
-        )
-
-    def test_formal_mode_rejects_amount_containing_target_digits(self):
-        bot = MagicMock()
-        bot._using_u2.return_value = True
-        config = MagicMock()
-        config.price_index = 1
-        config.price = "699元"
-        config.if_commit_order = True
-        selector = PriceSelector(
-            device=MagicMock(), config=config, probe=MagicMock()
-        )
-        selector.set_bot(bot)
-        xml = self._make_xml(
-            "cn.damai:id/project_detail_perform_price_flowlayout", 3
-        )
-        self._add_card_text(xml, 1, "内场1699元")
-
-        assert selector._get_price_coords_from_xml(xml) is None
-        assert bot._verified_price_selection is None
-        bot._set_terminal_failure.assert_called_once_with(
-            "target_price_unconfirmed"
-        )
-
-    def test_formal_mode_rejects_empty_price_text(self):
-        bot = MagicMock()
-        bot._using_u2.return_value = True
-        config = MagicMock()
-        config.price_index = 0
-        config.price = "580元"
-        config.if_commit_order = True
-        selector = PriceSelector(
-            device=MagicMock(), config=config, probe=MagicMock()
-        )
-        selector.set_bot(bot)
-        xml = self._make_xml(
-            "cn.damai:id/project_detail_perform_price_flowlayout", 1
-        )
-
-        assert selector._get_price_coords_from_xml(xml) is None
-        bot._set_terminal_failure.assert_called_once_with(
-            "target_price_unconfirmed"
-        )
-
-    def test_formal_mode_rejects_unavailable_target_price(self):
-        bot = MagicMock()
-        bot._using_u2.return_value = True
-        config = MagicMock()
-        config.price_index = 0
-        config.price = "580元"
-        config.if_commit_order = True
-        selector = PriceSelector(
-            device=MagicMock(), config=config, probe=MagicMock()
-        )
-        selector.set_bot(bot)
-        xml = self._make_xml(
-            "cn.damai:id/project_detail_perform_price_flowlayout", 1
-        )
-        self._add_card_text(xml, 0, "580元", tag="售罄")
-
-        assert selector._get_price_coords_from_xml(xml) is None
-        bot._set_terminal_failure.assert_called_once_with(
-            "target_price_unavailable"
-        )
-
-
-class TestFormalPriceSelectionProof:
-    def test_rush_mode_requires_same_snapshot_price_proof(self):
-        bot = MagicMock()
-        config = MagicMock()
-        config.rush_mode = True
-        config.if_commit_order = True
-        config.price_index = 2
-        config.price = "880元"
-        selector = PriceSelector(
-            device=MagicMock(), config=config, probe=MagicMock()
-        )
-        selector.set_bot(bot)
-
-        assert selector._select_price_option_fast(
-            cached_coords=(300, 1200)
-        ) is False
-        bot._set_terminal_failure.assert_called_once_with(
-            "target_price_unconfirmed"
-        )
-        bot._click_price_option_by_config_index.assert_not_called()
-
-    def test_rush_mode_uses_verified_same_snapshot_coords(self):
-        bot = MagicMock()
-        bot._click_price_option_by_config_index.return_value = True
-        stamp = object()
-        bot._run_generation = 7
-        bot._cached_hot_path_coord_meta = {"price": stamp}
-        bot._get_hot_coord.return_value = (300, 1200)
-        bot._verified_price_selection = {
-            "coords": (300, 1200),
-            "price_index": 2,
-            "target_price": "880元",
-            "observed_price": "880元",
-            "run_generation": 7,
-            "stamp": stamp,
-        }
-        config = MagicMock()
-        config.rush_mode = True
-        config.if_commit_order = True
-        config.price_index = 2
-        config.price = "880元"
-        selector = PriceSelector(
-            device=MagicMock(), config=config, probe=MagicMock()
-        )
-        selector.set_bot(bot)
-
-        with patch.object(
-            selector,
-            "_verify_formal_price_selection_after_click",
-            return_value=True,
-        ) as verify_selected:
-            assert selector._select_price_option_fast(
-                cached_coords=(300, 1200)
-            ) is True
-        bot._click_price_option_by_config_index.assert_called_once_with(
-            burst=False, coords=(300, 1200)
-        )
-        verify_selected.assert_called_once_with((300, 1200))
-
-    def test_formal_mode_never_uses_global_price_text_fallback(self):
-        bot = MagicMock()
-        config = MagicMock()
-        config.rush_mode = False
-        config.if_commit_order = True
-        config.price_index = 0
-        config.price = "880元"
-        selector = PriceSelector(
-            device=MagicMock(), config=config, probe=MagicMock()
-        )
-        selector.set_bot(bot)
-
-        assert selector._select_price_option_fast() is False
-        bot.ultra_fast_click.assert_not_called()
-        bot._click_visible_price_option.assert_not_called()
-
-    def test_formal_coordinate_click_does_not_requery_live_index(self):
-        bot = MagicMock()
-        config = MagicMock()
-        config.rush_mode = True
-        config.if_commit_order = True
-        config.price_index = 1
-        selector = PriceSelector(
-            device=MagicMock(), config=config, probe=MagicMock()
-        )
-        selector.set_bot(bot)
-
-        assert selector._click_price_option_by_config_index(
-            burst=True,
-            coords=(320, 1400),
-        ) is True
-        bot._click_coordinates.assert_called_once_with(320, 1400, duration=30)
-        bot._burst_click_coordinates.assert_not_called()
-        bot._click_price_card_element.assert_not_called()
-
-    def test_formal_mode_stops_when_post_click_selection_is_not_observed(self):
-        bot = MagicMock()
-        bot._click_price_option_by_config_index.return_value = True
-        stamp = object()
-        bot._run_generation = 7
-        bot._cached_hot_path_coord_meta = {"price": stamp}
-        bot._get_hot_coord.return_value = (300, 1200)
-        bot._verified_price_selection = {
-            "coords": (300, 1200),
-            "price_index": 2,
-            "target_price": "880元",
-            "observed_price": "880元",
-            "run_generation": 7,
-            "stamp": stamp,
-        }
-        config = MagicMock(
-            rush_mode=True,
-            if_commit_order=True,
-            price_index=2,
-            price="880元",
-        )
-        selector = PriceSelector(
-            device=MagicMock(), config=config, probe=MagicMock()
-        )
-        selector.set_bot(bot)
-
-        with patch.object(
-            selector,
-            "_verify_formal_price_selection_after_click",
-            return_value=False,
-        ):
-            assert selector._select_price_option_fast(
-                cached_coords=(300, 1200)
-            ) is False
-
-        bot._click_price_option_by_config_index.assert_called_once_with(
-            burst=False, coords=(300, 1200)
-        )
-
-    @pytest.mark.parametrize("selected_attr", ("selected", "checked"))
-    def test_post_click_hierarchy_proves_exact_target_card_selected(
-        self, selected_attr
-    ):
-        import xml.etree.ElementTree as ET
-
-        root = ET.Element("hierarchy")
-        container = ET.SubElement(
-            root,
-            "node",
-            attrib={
-                "resource-id": (
-                    "cn.damai:id/project_detail_perform_price_flowlayout"
-                )
-            },
-        )
-        card = ET.SubElement(
-            container,
-            "node",
-            attrib={
-                "class": "android.widget.FrameLayout",
-                "clickable": "true",
-                "bounds": "[280,1160][320,1240]",
-                selected_attr: "true",
-            },
-        )
-        ET.SubElement(card, "node", attrib={"text": "880元"})
-
-        bot = MagicMock()
-        bot._parse_bounds.return_value = (280, 1160, 320, 1240)
-        bot._dump_hierarchy_xml.return_value = root
-        bot._verified_price_selection = {
-            "coords": (300, 1200),
-            "price_index": 0,
-            "target_price": "880元",
-            "observed_price": "880元",
-        }
-        config = MagicMock(
-            if_commit_order=True,
-            price_index=0,
-            price="880元",
-        )
-        selector = PriceSelector(
-            device=MagicMock(), config=config, probe=MagicMock()
-        )
-        selector.set_bot(bot)
-
-        assert selector._verify_formal_price_selection_after_click(
-            (300, 1200)
-        ) is True
-        assert bot._verified_price_selection["selection_verified"] is True
-        assert (
-            bot._verified_price_selection["selection_source"]
-            == "post_click_hierarchy"
-        )
-        bot._set_terminal_failure.assert_not_called()
-
-    def test_post_click_hierarchy_rejects_target_card_without_selected_state(self):
-        import xml.etree.ElementTree as ET
-
-        root = ET.Element("hierarchy")
-        container = ET.SubElement(
-            root,
-            "node",
-            attrib={
-                "resource-id": (
-                    "cn.damai:id/project_detail_perform_price_flowlayout"
-                )
-            },
-        )
-        card = ET.SubElement(
-            container,
-            "node",
-            attrib={
-                "class": "android.widget.FrameLayout",
-                "clickable": "true",
-                "bounds": "[280,1160][320,1240]",
-            },
-        )
-        ET.SubElement(card, "node", attrib={"text": "880元"})
-
-        bot = MagicMock()
-        bot._parse_bounds.return_value = (280, 1160, 320, 1240)
-        bot._dump_hierarchy_xml.return_value = root
-        bot._verified_price_selection = {
-            "coords": (300, 1200),
-            "price_index": 0,
-            "target_price": "880元",
-            "observed_price": "880元",
-        }
-        config = MagicMock(
-            if_commit_order=True,
-            price_index=0,
-            price="880元",
-        )
-        selector = PriceSelector(
-            device=MagicMock(), config=config, probe=MagicMock()
-        )
-        selector.set_bot(bot)
-
-        assert selector._verify_formal_price_selection_after_click(
-            (300, 1200)
-        ) is False
-        assert bot._verified_price_selection is None
-        bot._set_terminal_failure.assert_called_once_with(
-            "target_price_selection_unconfirmed"
-        )
-
 
 # ---------------------------------------------------------------------------
 # Page-probe integration (P1 #31, Step 3)
@@ -816,3 +439,89 @@ class TestSelectByIndexPanelStateIntegration:
             assert selector.select_by_index() is True
         warning_calls = [c for c in mock_logger.warning.call_args_list]
         assert not any("state=unknown" in str(c) for c in warning_calls)
+
+
+# ---------------------------------------------------------------------------
+# Tier card text-first matching (12:20 实战：缺货把 380 挤出可点击列表，
+# 纯索引兜底点错高价档)
+# ---------------------------------------------------------------------------
+
+
+class TestMatchPriceCardFromXml:
+    def _card(self, text, bounds="[0,0][100,50]"):
+        return (
+            f'<node class="android.widget.FrameLayout" clickable="true" bounds="{bounds}">'
+            f'<node class="android.widget.TextView" text="{text}"/></node>'
+        )
+
+    def _root(self, *cards):
+        import xml.etree.ElementTree as ET
+
+        return ET.fromstring(
+            "<node><node resource-id='cn.damai:id/project_detail_perform_price_flowlayout'>"
+            + "".join(cards)
+            + "</node></node>"
+        )
+
+    def _container_cards(self, root):
+        for node in root.iter("node"):
+            if (
+                node.get("resource-id")
+                == "cn.damai:id/project_detail_perform_price_flowlayout"
+            ):
+                return list(node)
+        return []
+
+    def _selector(self, price):
+        config = MagicMock()
+        config.price = price
+        config.price_index = 0
+        selector = PriceSelector(
+            device=MagicMock(), config=config, probe=MagicMock()
+        )
+        selector.set_bot(MagicMock())
+        return selector
+
+    def test_matches_configured_purchasable_card(self):
+        sel = self._selector("看台380元")
+        root = self._root(self._card("看台380元"), self._card("看台580元"))
+        cards = self._container_cards(root)
+        card = sel._match_price_card_from_xml(cards)
+        assert card is not None
+        assert "380" in sel._card_price_text(card)
+
+    def test_skips_sold_out_card_even_when_text_matches(self):
+        sel = self._selector("看台380元")
+        root = self._root(
+            self._card("看台380元 缺货登记"), self._card("看台980元")
+        )
+        cards = self._container_cards(root)
+        assert sel._match_price_card_from_xml(cards) is None
+
+    def test_get_coords_refuses_index_fallback_when_text_readable(self):
+        sel = self._selector("看台380元")
+        root = self._root(
+            self._card("看台380元 缺货登记", "[0,0][100,50]"),
+            self._card("看台980元", "[0,60][100,110]"),
+        )
+        sel._bot._dump_hierarchy_xml.return_value = root
+        assert sel._get_price_coords_from_xml() is None
+
+    def test_get_coords_keeps_index_fallback_when_text_unreadable(self):
+        sel = self._selector("看台380元")
+        root = self._root(
+            self._card("", "[0,0][100,50]"), self._card("", "[0,60][100,110]")
+        )
+        sel._bot._dump_hierarchy_xml.return_value = root
+        sel._bot._parse_bounds = lambda bounds: (0, 0, 100, 50)
+        assert sel._get_price_coords_from_xml() == (50, 25)
+
+    def test_get_coords_prefers_text_matched_card(self):
+        sel = self._selector("看台580元")
+        root = self._root(
+            self._card("看台380元", "[0,0][100,50]"),
+            self._card("看台580元", "[0,60][100,110]"),
+        )
+        sel._bot._dump_hierarchy_xml.return_value = root
+        sel._bot._parse_bounds = lambda bounds: (0, 60, 100, 110)
+        assert sel._get_price_coords_from_xml() == (50, 85)

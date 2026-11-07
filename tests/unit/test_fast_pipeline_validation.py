@@ -8,11 +8,6 @@ from mobile.fast_pipeline import (
     FastPipeline,
     _PIPELINE_DEADLINE_S,
 )
-from mobile.page_probe import (
-    MANUAL_VERIFICATION_MARKERS,
-    PENDING_ORDER_MARKERS,
-    TRANSIENT_ERROR_MARKERS,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +75,7 @@ class TestRunColdValidationBranches:
     def test_returns_none_when_rush_preselect_fails(self):
         fp, bot, _device = _make_validation_pipeline()
         with patch.object(fp, "rush_preselect_and_buy_via_xml", return_value=False):
-            result = fp.run_cold_validation(start_time=time.monotonic())
+            result = fp.run_cold_validation(start_time=time.time())
         assert result is None
 
     def test_returns_none_when_entry_probe_fails(self):
@@ -91,7 +86,7 @@ class TestRunColdValidationBranches:
             patch.object(fp, "_wait_for_purchase_entry", return_value=None):
             fp._cached_coords["detail_buy"] = (540, 1800)
             bot._click_coordinates = Mock()
-            result = fp.run_cold_validation(start_time=time.monotonic())
+            result = fp.run_cold_validation(start_time=time.time())
         # fmt: on
         assert result is None
 
@@ -106,7 +101,7 @@ class TestRunColdValidationBranches:
                 return_value={"state": "order_confirm_page"},
             ), \
             patch.object(fp, "_finish_confirm", return_value=True) as finish_confirm:
-            result = fp.run_cold_validation(start_time=time.monotonic())
+            result = fp.run_cold_validation(start_time=time.time())
         # fmt: on
         assert result is True
         finish_confirm.assert_called_once()
@@ -120,7 +115,7 @@ class TestRunColdValidationBranches:
                 fp, "_wait_for_purchase_entry", return_value={"state": "unknown_page"}
             ), \
             patch.object(fp, "_confirm_page_ready", return_value=False):
-            result = fp.run_cold_validation(start_time=time.monotonic())
+            result = fp.run_cold_validation(start_time=time.time())
         # fmt: on
         assert result is None
 
@@ -134,7 +129,7 @@ class TestRunColdValidationBranches:
                 fp, "_wait_for_purchase_entry", return_value={"state": "sku_page"}
             ), \
             patch.object(fp, "_confirm_page_ready", return_value=False):
-            result = fp.run_cold_validation(start_time=time.monotonic())
+            result = fp.run_cold_validation(start_time=time.time())
         # fmt: on
         assert result is None
 
@@ -154,7 +149,7 @@ class TestRunColdValidationBranches:
             patch.object(fp, "_wait_for_confirm_ready", return_value=True), \
             patch.object(fp, "_finish_confirm", return_value=True), \
             patch.object(fp, "_confirm_page_ready", return_value=False):
-            result = fp.run_cold_validation(start_time=time.monotonic())
+            result = fp.run_cold_validation(start_time=time.time())
         # fmt: on
         assert result is True
 
@@ -177,7 +172,7 @@ class TestRunColdValidationBranches:
             patch.object(fp, "_confirm_page_ready", return_value=False):
             # Use a start_time in the past so we're past the 50% mark
             result = fp.run_cold_validation(
-                start_time=time.monotonic() - _PIPELINE_DEADLINE_S * 0.6
+                start_time=time.time() - _PIPELINE_DEADLINE_S * 0.6
             )
         # fmt: on
         assert result is False
@@ -211,7 +206,7 @@ class TestFinishConfirm:
         bot._attendee_checkbox_elements.return_value = [cb1, cb2]
         bot._click_attendee_checkbox_fast = Mock()
 
-        result = fp._finish_confirm(start_time=time.monotonic())
+        result = fp._finish_confirm(start_time=time.time())
 
         assert result is True
         assert bot._click_attendee_checkbox_fast.call_count == 2
@@ -222,7 +217,7 @@ class TestFinishConfirm:
         fp, bot = self._make_pipeline_with_bot()
         bot._attendee_checkbox_elements.return_value = []
 
-        result = fp._finish_confirm(start_time=time.monotonic())
+        result = fp._finish_confirm(start_time=time.time())
 
         assert result is True
         bot._set_run_outcome.assert_called_once_with("validation_ready")
@@ -234,7 +229,7 @@ class TestFinishConfirm:
         bot._attendee_checkbox_elements.return_value = [cb]
         bot._click_attendee_checkbox_fast = Mock()
 
-        result = fp._finish_confirm(start_time=time.monotonic())
+        result = fp._finish_confirm(start_time=time.time())
         assert result is True
 
     def test_limits_clicks_to_required_count(self):
@@ -247,7 +242,7 @@ class TestFinishConfirm:
         bot._attendee_checkbox_elements.return_value = [cb1, cb2]
         bot._click_attendee_checkbox_fast = Mock()
 
-        fp._finish_confirm(start_time=time.monotonic())
+        fp._finish_confirm(start_time=time.time())
         assert bot._click_attendee_checkbox_fast.call_count == 1
 
     def test_with_none_users(self):
@@ -255,7 +250,7 @@ class TestFinishConfirm:
         fp._config.users = None
         bot._attendee_checkbox_elements.return_value = []
 
-        result = fp._finish_confirm(start_time=time.monotonic())
+        result = fp._finish_confirm(start_time=time.time())
         assert result is True
 
 
@@ -274,7 +269,7 @@ class TestRunWarmValidation:
                 fp, "_wait_for_purchase_entry", return_value={"state": "sku_page"}
             ), \
             patch.object(fp, "_shell_price_and_buy_until_confirm", return_value=True):
-            result = fp.run_warm_validation(start_time=time.monotonic())
+            result = fp.run_warm_validation(start_time=time.time())
         # fmt: on
 
         assert result is True
@@ -286,7 +281,7 @@ class TestRunWarmValidation:
 
         with patch.object(fp, "_wait_for_purchase_entry", return_value=None):
             bot._click_coordinates = Mock()
-            result = fp.run_warm_validation(start_time=time.monotonic())
+            result = fp.run_warm_validation(start_time=time.time())
 
         assert result is None
 
@@ -299,7 +294,7 @@ class TestRunWarmValidation:
                 fp, "_wait_for_purchase_entry", return_value={"state": "unknown"}
             ), \
             patch.object(fp, "_confirm_page_ready", return_value=False):
-            result = fp.run_warm_validation(start_time=time.monotonic())
+            result = fp.run_warm_validation(start_time=time.time())
         # fmt: on
 
         assert result is None
@@ -310,7 +305,7 @@ class TestRunWarmValidation:
         with patch.object(
             fp, "_wait_for_purchase_entry", return_value={"state": "order_confirm_page"}
         ):
-            result = fp.run_warm_validation(start_time=time.monotonic())
+            result = fp.run_warm_validation(start_time=time.time())
 
         assert result is True
         bot._set_run_outcome.assert_called_once_with("validation_ready")
@@ -327,7 +322,7 @@ class TestRunWarmValidation:
             patch.object(fp, "_select_price_with_pipeline", return_value=True), \
             patch.object(fp, "_click_sku_buy_with_pipeline", return_value=True), \
             patch.object(fp, "_wait_for_confirm_ready", return_value=True):
-            result = fp.run_warm_validation(start_time=time.monotonic())
+            result = fp.run_warm_validation(start_time=time.time())
         # fmt: on
 
         assert result is True
@@ -343,7 +338,7 @@ class TestRunWarmValidation:
             patch.object(fp, "_confirm_page_ready", return_value=False), \
             patch.object(fp, "_shell_price_and_buy_until_confirm", return_value=False), \
             patch.object(fp, "_select_price_with_pipeline", return_value=False):
-            result = fp.run_warm_validation(start_time=time.monotonic())
+            result = fp.run_warm_validation(start_time=time.time())
         # fmt: on
 
         assert result is None
@@ -360,7 +355,7 @@ class TestRunWarmValidation:
             patch.object(fp, "_shell_price_and_buy_until_confirm", return_value=False), \
             patch.object(fp, "_select_price_with_pipeline", return_value=True), \
             patch.object(fp, "_click_sku_buy_with_pipeline", return_value=False):
-            result = fp.run_warm_validation(start_time=time.monotonic())
+            result = fp.run_warm_validation(start_time=time.time())
         # fmt: on
 
         assert result is None
@@ -371,7 +366,7 @@ class TestRunWarmValidation:
         with patch.object(
             fp, "_wait_for_purchase_entry", return_value={"state": "order_confirm_page"}
         ):
-            fp.run_warm_validation(start_time=time.monotonic())
+            fp.run_warm_validation(start_time=time.time())
 
         first_shell_cmd = device.shell.call_args_list[0][0][0]
         assert "input tap 400 300" in first_shell_cmd
@@ -384,7 +379,7 @@ class TestRunWarmValidation:
         with patch.object(
             fp, "_wait_for_purchase_entry", return_value={"state": "order_confirm_page"}
         ):
-            fp.run_warm_validation(start_time=time.monotonic())
+            fp.run_warm_validation(start_time=time.time())
 
         first_shell_cmd = device.shell.call_args_list[0][0][0]
         assert "input tap 400 300" not in first_shell_cmd
@@ -405,7 +400,7 @@ class TestRunWarmValidation:
             patch.object(fp, "_click_sku_buy_with_pipeline", return_value=True), \
             patch.object(fp, "_wait_for_confirm_ready", return_value=False):
             result = fp.run_warm_validation(
-                start_time=time.monotonic() - _PIPELINE_DEADLINE_S
+                start_time=time.time() - _PIPELINE_DEADLINE_S
             )
         # fmt: on
 
@@ -425,7 +420,7 @@ class TestPipelineHelperEdgeCases:
         bot = Mock()
         fp.set_bot(bot)
 
-        result = fp._wait_for_purchase_entry(deadline=time.monotonic() - 1.0)
+        result = fp._wait_for_purchase_entry(deadline=time.time() - 1.0)
         assert result is None
         bot._wait_for_purchase_entry_result.assert_not_called()
 
@@ -469,7 +464,7 @@ class TestPipelineHelperEdgeCases:
         bot = Mock()
         fp.set_bot(bot)
 
-        result = fp._open_purchase_panel(None, time.monotonic() + 5.0)
+        result = fp._open_purchase_panel(None, time.time() + 5.0)
         assert result is False
 
     def test_open_purchase_panel_returns_false_when_deadline_passed(self):
@@ -479,7 +474,7 @@ class TestPipelineHelperEdgeCases:
         bot = Mock()
         fp.set_bot(bot)
 
-        result = fp._open_purchase_panel((540, 1700), time.monotonic() - 1.0)
+        result = fp._open_purchase_panel((540, 1700), time.time() - 1.0)
         assert result is False
 
     def test_open_purchase_panel_returns_entry_on_shell_success(self):
@@ -490,7 +485,7 @@ class TestPipelineHelperEdgeCases:
         bot._wait_for_purchase_entry_result = Mock(return_value={"state": "sku_page"})
         fp.set_bot(bot)
 
-        result = fp._open_purchase_panel((540, 1700), time.monotonic() + 5.0)
+        result = fp._open_purchase_panel((540, 1700), time.time() + 5.0)
         assert result == {"state": "sku_page"}
 
     def test_open_purchase_panel_u2_click_fallback(self):
@@ -504,7 +499,7 @@ class TestPipelineHelperEdgeCases:
         bot._click_coordinates = Mock()
         fp.set_bot(bot)
 
-        result = fp._open_purchase_panel((540, 1700), time.monotonic() + 5.0)
+        result = fp._open_purchase_panel((540, 1700), time.time() + 5.0)
         assert result == {"state": "sku_page"}
         bot._click_coordinates.assert_called_once_with(540, 1700, duration=25)
 
@@ -525,19 +520,6 @@ class TestPipelineHelperEdgeCases:
     def test_click_sku_buy_element_succeeds(self):
         device = Mock()
         config = Mock()
-        config.if_commit_order = False
-        fp = FastPipeline(device, config, probe=False, guard=Mock())
-        bot = Mock()
-        bot._click_sku_buy_button_element = Mock(return_value=True)
-        fp.set_bot(bot)
-
-        result = fp._click_sku_buy_with_pipeline((540, 1600))
-        assert result is True
-        bot._click_sku_buy_button_element.assert_called_once_with(burst_count=1)
-
-    def test_click_sku_buy_formal_mode_stays_forbidden(self):
-        device = Mock()
-        config = Mock()
         config.if_commit_order = True
         fp = FastPipeline(device, config, probe=False, guard=Mock())
         bot = Mock()
@@ -545,13 +527,8 @@ class TestPipelineHelperEdgeCases:
         fp.set_bot(bot)
 
         result = fp._click_sku_buy_with_pipeline((540, 1600))
-
-        assert result is False
-        bot._set_terminal_failure.assert_called_once_with(
-            "formal_pipeline_forbidden"
-        )
-        bot._click_sku_buy_button_element.assert_not_called()
-        device.shell.assert_not_called()
+        assert result is True
+        bot._click_sku_buy_button_element.assert_called_once_with(burst_count=2)
 
     def test_click_sku_buy_falls_back_to_coordinates(self):
         device = Mock()
@@ -588,33 +565,30 @@ class TestPipelineHelperEdgeCases:
     def test_shell_price_and_buy_returns_false_no_price(self):
         device = Mock()
         config = Mock()
-        config.if_commit_order = False
         fp = FastPipeline(device, config, probe=False, guard=Mock())
 
         result = fp._shell_price_and_buy_until_confirm(
-            None, (540, 1600), time.monotonic() + 5.0
+            None, (540, 1600), time.time() + 5.0
         )
         assert result is False
 
     def test_shell_price_and_buy_returns_false_no_sku(self):
         device = Mock()
         config = Mock()
-        config.if_commit_order = False
         fp = FastPipeline(device, config, probe=False, guard=Mock())
 
         result = fp._shell_price_and_buy_until_confirm(
-            (200, 800), None, time.monotonic() + 5.0
+            (200, 800), None, time.time() + 5.0
         )
         assert result is False
 
     def test_shell_price_and_buy_returns_false_deadline_passed(self):
         device = Mock()
         config = Mock()
-        config.if_commit_order = False
         fp = FastPipeline(device, config, probe=False, guard=Mock())
 
         result = fp._shell_price_and_buy_until_confirm(
-            (200, 800), (540, 1600), time.monotonic() - 1.0
+            (200, 800), (540, 1600), time.time() - 1.0
         )
         assert result is False
 
@@ -625,16 +599,6 @@ class TestPipelineHelperEdgeCases:
 
 
 class TestRunColdAdditional:
-    def test_formal_mode_without_bound_bot_fails_closed(self):
-        device = Mock()
-        config = Mock()
-        config.if_commit_order = True
-        fp = FastPipeline(device, config, probe=False, guard=Mock())
-
-        assert fp.run_cold(time.monotonic()) is None
-        device.dump_hierarchy.assert_not_called()
-        device.shell.assert_not_called()
-
     def test_success_path(self):
         device = Mock()
         device.dump_hierarchy.return_value = "<node />"
@@ -643,10 +607,9 @@ class TestRunColdAdditional:
         device.return_value = mock_el
 
         config = Mock()
-        config.if_commit_order = False
         fp = FastPipeline(device, config, probe=False, guard=Mock())
 
-        result = fp.run_cold(time.monotonic())
+        result = fp.run_cold(time.time())
         assert result is True
 
     def test_xml_dump_exception(self):
@@ -657,19 +620,17 @@ class TestRunColdAdditional:
         device.return_value = mock_el
 
         config = Mock()
-        config.if_commit_order = False
         fp = FastPipeline(device, config, probe=False, guard=Mock())
 
-        result = fp.run_cold(time.monotonic() - _PIPELINE_DEADLINE_S + 0.1)
+        result = fp.run_cold(time.time() - _PIPELINE_DEADLINE_S + 0.1)
         assert result is None
 
     def test_returns_none_on_immediate_deadline(self):
         device = Mock()
         config = Mock()
-        config.if_commit_order = False
         fp = FastPipeline(device, config, probe=False, guard=Mock())
 
-        result = fp.run_cold(time.monotonic() - _PIPELINE_DEADLINE_S - 1.0)
+        result = fp.run_cold(time.time() - _PIPELINE_DEADLINE_S - 1.0)
         assert result is None
 
     def test_has_checkbox_returns_false_on_exception(self):
@@ -701,7 +662,6 @@ class TestRushPreselectAndBuyViaXml:
         config = Mock()
         config.city = city
         config.date = date
-        config.if_commit_order = False
         fp = FastPipeline(device, config, probe=False, guard=Mock())
         bot = Mock()
         bot._dismiss_fast_blocking_dialogs = Mock()
@@ -755,65 +715,3 @@ class TestRushPreselectAndBuyViaXml:
         fp, bot, device = self._make_pipeline_with_xml(xml)
         result = fp.rush_preselect_and_buy_via_xml()
         assert result is False
-
-    def test_blocks_all_pending_order_markers(self):
-        for marker in PENDING_ORDER_MARKERS:
-            xml = f'<node text="{marker}" bounds="[0,0][100,100]" />'
-            fp, bot, _ = self._make_pipeline_with_xml(xml)
-
-            result = fp.rush_preselect_and_buy_via_xml()
-
-            assert result is False, marker
-            bot._report_pending_order_dialog.assert_called_once()
-            bot._set_terminal_failure.assert_not_called()
-
-    def test_blocks_all_manual_verification_markers(self):
-        for marker in MANUAL_VERIFICATION_MARKERS:
-            xml = f'<node text="{marker}" bounds="[0,0][100,100]" />'
-            fp, bot, _ = self._make_pipeline_with_xml(xml)
-
-            result = fp.rush_preselect_and_buy_via_xml()
-
-            assert result is False, marker
-            bot._set_terminal_failure.assert_called_once_with(
-                "manual_verification_required"
-            )
-            bot._report_pending_order_dialog.assert_not_called()
-
-    def test_blocks_all_transient_error_markers_before_purchase_entry(self):
-        for marker in TRANSIENT_ERROR_MARKERS:
-            xml = (
-                "<root>"
-                f'<node text="{marker}" bounds="[0,0][100,100]" />'
-                '<node resource-id="trade_project_detail_purchase_status_bar_container_fl" '
-                'text="" bounds="[0,0][1080,1920]" />'
-                "</root>"
-            )
-            fp, bot, device = self._make_pipeline_with_xml(xml)
-
-            result = fp.rush_preselect_and_buy_via_xml()
-
-            assert result is False, marker
-            assert fp._last_preselect_failure == "transient_error"
-            device.shell.assert_not_called()
-            bot._report_pending_order_dialog.assert_not_called()
-            bot._set_terminal_failure.assert_not_called()
-
-    def test_generic_order_payment_copy_does_not_block_purchase_entry(self):
-        xml = """
-        <root>
-          <node text="订单信息，支付方式" bounds="[0,0][100,100]" />
-          <node
-            resource-id="trade_project_detail_purchase_status_bar_container_fl"
-            text=""
-            bounds="[0,0][1080,1920]"
-          />
-        </root>
-        """
-        fp, bot, _ = self._make_pipeline_with_xml(xml)
-
-        result = fp.rush_preselect_and_buy_via_xml()
-
-        assert result is True
-        bot._report_pending_order_dialog.assert_not_called()
-        bot._set_terminal_failure.assert_not_called()

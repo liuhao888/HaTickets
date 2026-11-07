@@ -66,7 +66,6 @@ def mock_u2_driver():
     mock_driver.shell = Mock()
     mock_driver.app_current = Mock(return_value={"package": "cn.damai"})
     mock_driver.settings = {}
-    mock_driver.serial = "TESTSERIAL"
     yield mock_driver
 
 
@@ -107,7 +106,7 @@ def mock_time(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def reset_environment(monkeypatch, tmp_path):
+def reset_environment(monkeypatch):
     """Reset environment variables for each test."""
     # Clear any environment variables that might affect tests
     env_vars_to_clear = [
@@ -117,16 +116,10 @@ def reset_environment(monkeypatch, tmp_path):
         # 所有 config 相关测试（顺序相关的环境泄漏），必须逐测试清理。
         "HATICKETS_SERIAL",
         "HATICKETS_RESULT_JSON",
-        "HATICKETS_RUN_MODE",
-        "HATICKETS_COMMIT_AUTH",
-        "HATICKETS_STATE_DIR",
     ]
 
     for var in env_vars_to_clear:
         monkeypatch.delenv(var, raising=False)
-    # Durable submit journals must never leak between tests or touch the
-    # developer's real per-user state directory.
-    monkeypatch.setenv("HATICKETS_STATE_DIR", str(tmp_path / "hatickets-state"))
 
 
 @pytest.fixture
@@ -169,7 +162,6 @@ def mobile_config():
     from mobile.config import Config as MobileConfig
 
     return MobileConfig(
-        serial="TESTSERIAL",
         keyword="test",
         users=["UserA", "UserB"],
         city="深圳",

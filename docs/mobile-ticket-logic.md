@@ -33,7 +33,7 @@
 - `price`: 目标票价
 - `price_index`: 票价在列表中的索引位置
 - `if_commit_order`: 是否自动提交订单
-- `probe_only`: 仅做详情页探测，不执行购票点击
+- `probe_only`: 走完整下单流程，但不会点击“立即提交”
 - `auto_navigate`: 是否从大麦首页/搜索页自动进入目标演出
 - `sell_start_time`: 开售时间（ISO 格式字符串），null 表示立即购买
 - `countdown_lead_ms`: 提前轮询时间（毫秒），默认 3000
@@ -56,7 +56,7 @@ run_with_retry(max_retries=3)
         ├── check_session_valid()          # 登录状态检测
         ├── probe_current_page()           # 探测当前页面状态
         │   ├── 非目标演出页 => navigate_to_target_event()
-        │   └── probe_only => 验证控件后提前结束
+        │   └── probe_only 与正式下单同路径，仅在提交前停止
         ├── wait_for_sale_start()          # 倒计时等待 / CTA 就绪等待（可选）
         ├── 0. 选择场次日期
         ├── 1. 选择城市
@@ -158,9 +158,10 @@ driver.execute_script("mobile: clickGesture", {
 
 **`probe_only` 模式**
 
-- 只验证详情页关键控件是否就绪
-- 就绪后停止在真正购票点击前
-- 适合首次接设备、校验页面、验证选择器
+- 与正式抢票走同一套下单步骤：选场次、选票档、勾选观演人
+- 打印场次列表、价位列表和人员列表
+- 停在“立即提交”之前，不会提交订单
+- 适合首次接设备、核对场次/票档/观演人
 
 ### 4. 自动导航到目标演出
 

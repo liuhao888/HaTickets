@@ -2,7 +2,7 @@
 
 用 subprocess 直接驱动 bash 脚本，无需真机 / poetry / adb：
 - typo 用例在参数解析层（一切副作用之前）即退出
-- 合法参数用例通过裁剪 PATH（无 poetry）证明「解析层放行、版本诊断后止步于环境预检」
+- 合法参数用例通过裁剪 PATH（无 poetry）证明「解析层放行、止步于预检层」
 """
 
 import shutil
@@ -11,32 +11,22 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[2]
-SCRIPT = REPO / "mobile" / "scripts" / "start_ticket_grabbing.sh"
-# 无 poetry 的最小 PATH，用于验证合法参数停在运行环境预检层（exit 2）
+SCRIPT = (
+    Path(__file__).resolve().parents[2] / "mobile" / "scripts" / "start_ticket_grabbing.sh"
+)
+# 无 poetry 的最小 PATH，用于验证合法参数停在 poetry 预检层（exit 2）
 SAFE_PATH = "/usr/bin:/bin"
 
 
-def run_script(args, env=None, stdin=subprocess.DEVNULL, script=SCRIPT):
+def run_script(args, env=None, stdin=subprocess.DEVNULL):
     return subprocess.run(
-        ["bash", str(script), *args],
+        ["bash", str(SCRIPT), *args],
         capture_output=True,
         text=True,
         env=env,
         stdin=stdin,
         timeout=30,
     )
-
-
-def copy_isolated_start_script(tmp_path):
-    """Copy the startup layer so the real repository's .venv cannot affect tests."""
-    root = tmp_path / "repo"
-    script = root / "mobile" / "scripts" / "start_ticket_grabbing.sh"
-    preflight = root / "mobile" / "scripts" / "lib" / "preflight.sh"
-    preflight.parent.mkdir(parents=True)
-    shutil.copy2(SCRIPT, script)
-    shutil.copy2(REPO / "mobile" / "scripts" / "lib" / "preflight.sh", preflight)
-    return script
 
 
 @pytest.fixture
@@ -122,17 +112,12 @@ class TestLegalArgsPassParser:
         ],
         ids=lambda a: " ".join(a) if isinstance(a, list) else a,
     )
-    def test_legal_args_stop_at_environment_precheck(self, argv, tmp_path):
+    def test_legal_args_stop_at_poetry_precheck(self, argv, tmp_path):
         # 防呆：若某环境把 poetry 装进 /usr/bin，本测试假设不成立
         assert shutil.which("poetry", path=SAFE_PATH) is None, (
             "SAFE_PATH 下不应有 poetry，可调整 SAFE_PATH"
         )
-        script = copy_isolated_start_script(tmp_path)
-        r = run_script(
-            argv,
-            env={"PATH": SAFE_PATH, "HOME": str(tmp_path)},
-            script=script,
-        )
+        r = run_script(argv, env={"PATH": SAFE_PATH, "HOME": str(tmp_path)})
         assert r.returncode == 2
         combined = r.stdout + r.stderr
         assert "Poetry 未安装" in combined

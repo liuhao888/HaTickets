@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,15 +44,336 @@ _PRICE_UNAVAILABLE_TAGS = {
     "不可选",
     "暂不可售",
 }
-_PRICE_UNAVAILABLE_PATTERN = re.compile(
-    r"(无票|缺货|售罄|不可选|不可售|暂(?:时)?不可售|暂(?:时)?售罄)"
-)
-_PRICE_OPTION_INFO_TAGS = {
+# 长词在前，避免「缺货登记」被「缺货」截断。
+_STATUS_BADGES = (
+    "缺货登记",
+    "已售罄",
+    "暂不可售",
+    "不可选",
     "可预约",
-    "预售",
     "已预约",
-    "可选",
+    "售罄",
+    "无票",
+    "缺货",
+    "预售",
+)
+# 场次日期是自绘文字，OCR 常把连字符读成「一」「·」。
+_OCR_SESSION_RE = re.compile(
+    r"(20\d{2})\D{1,4}(\d{1,2})\D{1,4}(\d{1,2})\s*"
+    r"(?:星期|周)?([一二三四五六日天])?\s*"
+    r"(\d{1,2})\s*[:：]\s*(\d{2})"
+)
+
+
+def _bounds_tuple(bounds_text):
+    match = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds_text or "")
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def node_visible_texts(node):
+    """Read text and content-desc from a card, including itself."""
+    texts = []
+    seen = set()
+    for sub in node.iter("node"):
+        for attr in ("text", "content-desc"):
+            value = (sub.get(attr) or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                texts.append(value)
+    return texts
+
+
+def normalize_ocr_label(text):
+    """Turn a noisy OCR session line into ``2026-11-06 周五 19:00``."""
+    value = (text or "").strip()
+    if not value:
+        return ""
+    match = _OCR_SESSION_RE.search(value)
+    if not match:
+        return value
+    year, month, day, weekday, hour, minute = match.groups()
+    date = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    clock = f"{int(hour):02d}:{int(minute):02d}"
+    if weekday:
+        return f"{date} 周{weekday} {clock}"
+    return f"{date} {clock}"
+
+
+def hierarchy_has_sku_cards(xml_root):
+    """Whether this hierarchy already contains session or price cards."""
+    if xml_root is None or not hasattr(xml_root, "iter"):
+        return False
+    session = price = None
+    try:
+        for node in xml_root.iter("node"):
+            resource_id = node.get("resource-id")
+            if resource_id == "cn.damai:id/project_detail_perform_flowlayout":
+                session = node
+            elif resource_id == "cn.damai:id/project_detail_perform_price_flowlayout":
+                price = node
+    except Exception:
+        return False
+    return bool(flow_item_cards(session) or flow_item_cards(price))
+
+
+def split_label_and_badge(texts):
+    """Separate a tier/session label from status badges such as 缺货登记."""
+    badge = ""
+    labels = []
+    for raw in texts or []:
+        value = (raw or "").strip()
+        if not value:
+            continue
+        matched = ""
+        for candidate in _STATUS_BADGES:
+            if value == candidate:
+                matched = candidate
+                value = ""
+                break
+            if value.endswith(candidate) and len(value) > len(candidate):
+                matched = candidate
+                value = value[: -len(candidate)].strip(" ，,[]")
+                break
+        if matched and not badge:
+            badge = matched
+        if value and value not in _STATUS_BADGES:
+            labels.append(value)
+    label = "".join(labels).strip()
+    if re.fullmatch(r"\d{2,5}", label):
+        label = f"{label}元"
+    return label, badge
+
+
+def flow_item_cards(container):
+    """Return SKU cards in visual order.
+
+    New Damai pages use clickable ViewGroup rows. Status chips such as
+    「缺货登记」are small inner FrameLayouts and must not be treated as tiers.
+    """
+    if container is None:
+        return []
+
+    def _wide(bounds):
+        return bounds[2] - bounds[0] >= 160 and bounds[3] - bounds[1] >= 36
+
+    candidates = []
+    for node in container.iter("node"):
+        if node is container or node.get("clickable") != "true":
+            continue
+        bounds = _bounds_tuple(node.get("bounds", ""))
+        if bounds is None or not _wide(bounds):
+            continue
+        candidates.append((bounds, node))
+
+    outer = []
+    for bounds, node in candidates:
+        nested = False
+        for other_bounds, other in candidates:
+            if other is node or bounds == other_bounds:
+                continue
+            if (
+                bounds[0] >= other_bounds[0]
+                and bounds[1] >= other_bounds[1]
+                and bounds[2] <= other_bounds[2]
+                and bounds[3] <= other_bounds[3]
+            ):
+                nested = True
+                break
+        if not nested:
+            outer.append((bounds, node))
+
+    if not outer:
+        for child in list(container):
+            bounds = _bounds_tuple(child.get("bounds", ""))
+            if bounds is None or not _wide(bounds):
+                continue
+            outer.append((bounds, child))
+
+    outer.sort(key=lambda item: (item[0][1], item[0][0]))
+    return [node for _, node in outer]
+
+
+def label_bounds(node):
+    """Crop to the name area, leaving out the status chip on the right."""
+    bounds = _bounds_tuple(node.get("bounds", ""))
+    if bounds is None:
+        return None
+    for sub in node.iter("node"):
+        badge = (sub.get("text") or "").strip()
+        if badge not in _STATUS_BADGES and sub.get("resource-id") != "cn.damai:id/tv_tag":
+            continue
+        tag_bounds = _bounds_tuple(sub.get("bounds", ""))
+        if tag_bounds and tag_bounds[0] - bounds[0] >= 40:
+            return (bounds[0], bounds[1], max(bounds[0] + 8, tag_bounds[0] - 4), bounds[3])
+    return bounds
+
+
+def ocr_region_text(image_path, bounds):
+    """Read a card label from a screenshot crop. Empty string if OCR is unavailable."""
+    lines = ocr_regions(image_path, [bounds] if bounds else [])
+    return lines[0] if lines else ""
+
+
+def ocr_regions(image_path, bounds_list):
+    """Read several card labels with a single OCR process."""
+    if not image_path or not bounds_list or not os.path.exists(image_path):
+        return [""] * len(bounds_list or [])
+    crop_paths = []
+    try:
+        from PIL import Image
+
+        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+        with Image.open(image_path) as image:
+            for bounds in bounds_list:
+                crop_paths.append(_save_ocr_crop(image, bounds, resample))
+        if _TESSERACT_BIN:
+            recognized = [_tesseract_text(path) if path else "" for path in crop_paths]
+        else:
+            ready = [path for path in crop_paths if path]
+            ready_text = _windows_ocr_many(ready)
+            recognized = []
+            cursor = 0
+            for path in crop_paths:
+                if not path:
+                    recognized.append("")
+                    continue
+                recognized.append(
+                    ready_text[cursor] if cursor < len(ready_text) else ""
+                )
+                cursor += 1
+        labels = []
+        for text in recognized:
+            label, _badge = split_label_and_badge([text] if text else [])
+            labels.append(normalize_ocr_label(label))
+        return labels
+    except Exception:
+        logger.debug("区域 OCR 失败", exc_info=True)
+        return [""] * len(bounds_list)
+    finally:
+        for path in crop_paths:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+def _save_ocr_crop(image, bounds, resample):
+    if not bounds:
+        return None
+    left, top, right, bottom = bounds
+    if right - left < 8 or bottom - top < 8:
+        return None
+    crop = image.crop((left, top, min(right, image.width), min(bottom, image.height)))
+    if crop.width < 8 or crop.height < 8:
+        return None
+    crop = crop.resize((max(crop.width * 3, 1), max(crop.height * 3, 1)), resample)
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    path = tmp.name
+    tmp.close()
+    crop.save(path)
+    return path
+
+
+def _tesseract_text(image_path):
+    if not _TESSERACT_BIN:
+        return ""
+    for language in ("chi_sim+eng", "eng"):
+        try:
+            result = subprocess.run(
+                [
+                    _TESSERACT_BIN,
+                    image_path,
+                    "stdout",
+                    "-l",
+                    language,
+                    "--psm",
+                    "7",
+                ],
+                check=False,
+                capture_output=True,
+            )
+        except Exception:
+            return ""
+        if result.returncode != 0:
+            continue
+        text = (result.stdout or b"").decode("utf-8", "ignore")
+        text = re.sub(r"\s+", "", text)
+        if text:
+            return text
+    return ""
+
+
+def _windows_ocr_many(image_paths):
+    """Recognize several crops in one Windows OCR process."""
+    paths = [path for path in image_paths if path and os.path.exists(path)]
+    if os.name != "nt" or not paths:
+        return [""] * len(image_paths)
+    list_file = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as handle:
+            list_file = handle.name
+            handle.write("\n".join(paths))
+        script = r"""
+$list = $env:HATICKETS_OCR_LIST
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType = WindowsRuntime]
+$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+  $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+})[0]
+function Await([object]$task, [type]$type) {
+  $method = $asTask.MakeGenericMethod($type)
+  $net = $method.Invoke($null, @($task))
+  $net.Wait(-1) | Out-Null
+  $net.Result
 }
+$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+foreach ($path in Get-Content -LiteralPath $list -Encoding UTF8) {
+  if (-not $path) { Write-Output ""; continue }
+  $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($path)) ([Windows.Storage.StorageFile])
+  $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+  $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+  $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+  $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+  Write-Output (($result.Text -replace '\s',''))
+}
+"""
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            check=False,
+            capture_output=True,
+            env={**os.environ, "HATICKETS_OCR_LIST": list_file},
+            timeout=30,
+        )
+    except Exception:
+        return [""] * len(image_paths)
+    finally:
+        if list_file and os.path.exists(list_file):
+            try:
+                os.unlink(list_file)
+            except OSError:
+                pass
+    if completed.returncode != 0:
+        return [""] * len(image_paths)
+    lines = [
+        re.sub(r"\s+", "", line)
+        for line in (completed.stdout or b"").decode("utf-8", "ignore").splitlines()
+    ]
+    if len(lines) < len(paths):
+        lines.extend([""] * (len(paths) - len(lines)))
+    return lines[: len(paths)]
+
+
+def _windows_ocr_text(image_path):
+    """Use the built-in Windows OCR engine when tesseract is not installed."""
+    lines = _windows_ocr_many([image_path])
+    return lines[0] if lines else ""
 
 
 # ---------------------------------------------------------------------------
@@ -305,8 +627,8 @@ class PriceSelector:
             result = self._get_price_coords_from_xml(xml_root)
             if result is not None:
                 return result
-            # Retry once after short wait (cards may still be loading)
-            if xml_root is not None:
+            # 票档已经铺满时再等 0.3 秒并重抓界面，只会拖慢已打开的选择页。
+            if xml_root is not None and self._price_sheet_still_loading(xml_root):
                 import time
 
                 time.sleep(0.3)
@@ -338,11 +660,38 @@ class PriceSelector:
             rect["y"] + rect["height"] // 2,
         )
 
+    def _price_sheet_still_loading(self, xml_root):
+        """票档容器还没铺到配置索引时，才值得再抓一次界面。"""
+        if xml_root is None:
+            return True
+        container_ids = (
+            "cn.damai:id/project_detail_perform_price_flowlayout",
+            "cn.damai:id/layout_price",
+        )
+        for node in xml_root.iter("node"):
+            if node.get("resource-id") not in container_ids:
+                continue
+            cards = [
+                child
+                for child in list(node)
+                if child.get("class") == "android.widget.FrameLayout"
+                and child.get("clickable") == "true"
+            ]
+            if not cards:
+                cards = flow_item_cards(node)
+            if len(cards) > self._config.price_index:
+                return False
+        return True
+
     def _get_price_coords_from_xml(self, xml_root=None):
         """Extract price card coordinates from XML hierarchy.
 
         Searches multiple container IDs to handle both detail-page and SKU-page layouts.
         Returns (x, y) tuple or None.
+
+        卡片优先按配置文本匹配（且不带缺货标签）；文本匹配不到但卡片文本可读时
+        不做索引兜底——库存秒变“缺货登记”会把 380 挤出可点击列表，纯索引会点到
+        错误的高价档（12:20 实战教训）。
         """
         bot = self._bot
         if xml_root is None:
@@ -365,80 +714,76 @@ class PriceSelector:
                     ]
                     if not cards:
                         continue
+                    matched = self._match_price_card_from_xml(cards)
+                    if matched is not None:
+                        bounds = bot._parse_bounds(matched.get("bounds", ""))
+                        if bounds:
+                            left, top, right, bottom = bounds
+                            return ((left + right) // 2, (top + bottom) // 2)
+                        continue
+                    if self._price_cards_text_readable(cards):
+                        # 名称经常还没写进界面树，这时只有「缺货登记」。
+                        # 不要据此判断 780 和「内场780元」不匹配。
+                        if self._xml_cards_have_price_digits(cards):
+                            logger.warning(
+                                "票档文本与配置 %r 不匹配或已缺货，放弃索引兜底以防买错档",
+                                self._config.price,
+                            )
+                        else:
+                            logger.debug(
+                                "界面树里还没有票价数字，坐标改由识别结果匹配 %s",
+                                self._config.price,
+                            )
+                        continue
                     if not (0 <= self._config.price_index < len(cards)):
                         logger.debug(
                             f"price_index={self._config.price_index} 超出 {container_id} "
                             f"中的 {len(cards)} 个可点击卡片"
                         )
                         continue
-                    selected_card = cards[self._config.price_index]
-                    if self._is_formal_commit():
-                        texts = []
-                        seen = set()
-                        for descendant in selected_card.iter("node"):
-                            for attr in ("text", "content-desc"):
-                                value = (descendant.get(attr) or "").strip()
-                                if value and value not in seen:
-                                    texts.append(value)
-                                    seen.add(value)
-                        price_text = self._price_option_text_from_descendants(
-                            texts
-                        )
-                        tag = self._unavailable_price_tag(texts)
-                        if tag:
-                            bot._verified_price_selection = None
-                            bot._set_terminal_failure(
-                                "target_price_unavailable"
-                            )
-                            logger.warning(
-                                "配置票档当前不可选，正式模式停止: "
-                                "price_index=%s tag=%s",
-                                self._config.price_index,
-                                tag,
-                            )
-                            return None
-                        if not price_text or not self._price_text_matches_target(
-                            price_text
-                        ):
-                            bot._verified_price_selection = None
-                            bot._set_terminal_failure(
-                                "target_price_unconfirmed"
-                            )
-                            logger.error(
-                                "配置票档文案未确认，正式模式禁止按索引盲点: "
-                                "price_index=%s observed=%s",
-                                self._config.price_index,
-                                price_text or "(empty)",
-                            )
-                            return None
-
                     bounds = bot._parse_bounds(
-                        selected_card.get("bounds", "")
+                        cards[self._config.price_index].get("bounds", "")
                     )
                     if bounds:
                         left, top, right, bottom = bounds
-                        coords = (
-                            (left + right) // 2,
-                            (top + bottom) // 2,
-                        )
-                        if self._is_formal_commit():
-                            bot._verified_price_selection = {
-                                "coords": coords,
-                                "price_index": self._config.price_index,
-                                "target_price": normalize_text(
-                                    self._config.price
-                                ),
-                                "observed_price": normalize_text(price_text),
-                            }
-                            if self._formal_price_card_is_selected(selected_card):
-                                bot._verified_price_selection.update(
-                                    {
-                                        "selection_verified": True,
-                                        "selection_source": "same_snapshot",
-                                    }
-                                )
-                        return coords
+                        return ((left + right) // 2, (top + bottom) // 2)
         return None
+
+    def _card_price_text(self, card):
+        """Concatenate a tier card's visible texts (text attrs + content-desc)."""
+        parts = []
+        for sub in card.iter("node"):
+            for attr in ("text", "content-desc"):
+                value = (sub.get(attr) or "").strip()
+                if value:
+                    parts.append(value)
+        return " ".join(parts)
+
+    def _match_price_card_from_xml(self, cards):
+        """Return the card matching the configured price and free of sold-out tags."""
+        for card in cards:
+            text = self._card_price_text(card)
+            if not text:
+                continue
+            if any(tag in text for tag in _PRICE_UNAVAILABLE_TAGS):
+                continue
+            if self._price_text_matches_target(text):
+                return card
+        return None
+
+    def _price_cards_text_readable(self, cards):
+        """Whether any tier card exposes readable text (else index fallback is safe)."""
+        return any(self._card_price_text(card) for card in cards)
+
+    def _xml_cards_have_price_digits(self, cards):
+        """True when a card label contains a price number, not only a status badge."""
+        for card in cards:
+            label, _badge = split_label_and_badge(
+                [part for part in self._card_price_text(card).split(" ") if part]
+            )
+            if self._extract_price_digits(label):
+                return True
+        return False
 
     def _extract_price_digits(self, text):
         """Extract the numeric portion of a ticket price label."""
@@ -448,271 +793,47 @@ class PriceSelector:
             return int(match.group(1))
         return None
 
-    def _price_label_without_amount(self, text):
-        """Return an optional SKU label after removing amount/currency noise."""
-        normalized = normalize_text(text)
-        normalized = re.sub(
-            r"[¥￥]?[1-9]\d{1,4}(?:\.\d{1,2})?(?:元|rmb|cny)?",
-            "",
-            normalized,
-            flags=re.IGNORECASE,
-        )
-        for generic in ("票价", "价格", "售价", "人民币", "rmb", "cny", "元", "起"):
-            normalized = normalized.replace(generic, "")
-        return normalized
-
     def _price_text_matches_target(self, text):
         """Check whether a visible price label matches the configured price."""
         normalized_target = normalize_text(self._config.price)
         normalized_text = normalize_text(text)
-        target_digits = self._extract_price_digits(self._config.price)
-        text_digits = self._extract_price_digits(text)
-        if target_digits is not None or text_digits is not None:
+        if normalized_target and normalized_text:
             if (
-                target_digits is None
-                or text_digits is None
-                or target_digits != text_digits
-            ):
-                return False
-            target_label = self._price_label_without_amount(
-                self._config.price
-            )
-            text_label = self._price_label_without_amount(text)
-            if target_label and text_label:
-                return (
-                    target_label in text_label
-                    or text_label in target_label
-                )
-            return True
-
-        return bool(
-            normalized_target
-            and normalized_text
-            and (
                 normalized_target in normalized_text
                 or normalized_text in normalized_target
-            )
-        )
-
-    def _is_formal_commit(self):
-        """Return True only for the explicitly authorised submit mode."""
-        return getattr(self._config, "if_commit_order", False) is True
-
-    @staticmethod
-    def _formal_price_card_is_selected(card) -> bool:
-        """Return whether one price card exposes an explicit selected state."""
-        for node in card.iter("node"):
-            if (node.get("selected") or "").strip().lower() == "true":
-                return True
-            if (node.get("checked") or "").strip().lower() == "true":
-                return True
-            visible_state = " ".join(
-                value.strip()
-                for value in (
-                    node.get("text") or "",
-                    node.get("content-desc") or "",
-                )
-                if value and value.strip()
-            )
-            if any(
-                marker in visible_state
-                for marker in ("已选中", "已选择", "当前选中")
             ):
                 return True
-        return False
 
-    def _formal_price_card_snapshot(self, xml_root):
-        """Describe the configured card from one post-click hierarchy."""
-        if xml_root is None:
-            return None
-        bot = self._bot
-        for container_id in (
-            "cn.damai:id/project_detail_perform_price_flowlayout",
-            "cn.damai:id/layout_price",
-        ):
-            for node in xml_root.iter("node"):
-                if node.get("resource-id") != container_id:
-                    continue
-                cards = [
-                    child
-                    for child in node
-                    if child.get("class") == "android.widget.FrameLayout"
-                    and child.get("clickable") == "true"
-                ]
-                if not (0 <= self._config.price_index < len(cards)):
-                    continue
-                card = cards[self._config.price_index]
-                texts = []
-                seen = set()
-                for descendant in card.iter("node"):
-                    for attr in ("text", "content-desc"):
-                        value = (descendant.get(attr) or "").strip()
-                        if value and value not in seen:
-                            texts.append(value)
-                            seen.add(value)
-                price_text = self._price_option_text_from_descendants(texts)
-                bounds = bot._parse_bounds(card.get("bounds", ""))
-                coords = None
-                if bounds:
-                    left, top, right, bottom = bounds
-                    coords = ((left + right) // 2, (top + bottom) // 2)
-                return {
-                    "coords": coords,
-                    "observed_price": normalize_text(price_text),
-                    "target_matches": bool(
-                        price_text and self._price_text_matches_target(price_text)
-                    ),
-                    "unavailable": bool(self._unavailable_price_tag(texts)),
-                    "selected": self._formal_price_card_is_selected(card),
-                }
-        return None
-
-    def _formal_cached_price_is_verified(
-        self, cached_coords, *, require_selected=True
-    ):
-        """Validate same-snapshot evidence before a rush-mode price click."""
-        if not cached_coords:
-            return False
-        proof = getattr(self._bot, "_verified_price_selection", None)
-        if not isinstance(proof, dict):
-            return False
-        observed_price = proof.get("observed_price")
-        if not (
-            proof.get("coords") == cached_coords
-            and proof.get("price_index") == self._config.price_index
-            and proof.get("target_price")
-            == normalize_text(self._config.price)
-            and isinstance(observed_price, str)
-            and self._price_text_matches_target(observed_price)
-            and proof.get("run_generation")
-            == getattr(self._bot, "_run_generation", None)
-            and (
-                not require_selected
-                or proof.get("selection_verified") is True
-            )
-        ):
-            return False
-        stored_stamp = getattr(
-            self._bot, "_cached_hot_path_coord_meta", {}
-        ).get("price")
-        if proof.get("stamp") != stored_stamp or stored_stamp is None:
-            return False
-        cache_getter = getattr(self._bot, "_get_hot_coord", None)
-        if not callable(cache_getter):
-            return False
-        return (
-            cache_getter(
-                "price",
-                scope="sku",
-                page_state="sku_page",
-            )
-            == cached_coords
-        )
-
-    def _verify_formal_price_selection_after_click(self, cached_coords):
-        """Require a fresh hierarchy to prove the intended price is selected."""
-        bot = self._bot
-        xml_root = bot._dump_hierarchy_xml()
-        snapshot = self._formal_price_card_snapshot(xml_root)
-        if not (
-            isinstance(snapshot, dict)
-            and snapshot.get("coords") == cached_coords
-            and snapshot.get("target_matches") is True
-            and snapshot.get("unavailable") is False
-            and snapshot.get("selected") is True
-        ):
-            bot._verified_price_selection = None
-            bot._set_terminal_failure("target_price_selection_unconfirmed")
-            logger.error(
-                "票档点击后未观察到目标票档的明确选中状态，"
-                "已停止确定购买，避免按默认或错误票档继续"
-            )
-            return False
-
-        verify_session = getattr(
-            type(bot), "_verify_formal_session_filters_same_snapshot", None
-        )
-        if callable(verify_session) and not verify_session(bot, xml_root):
-            bot._verified_price_selection = None
-            bot._set_terminal_failure("session_filter_unconfirmed")
-            logger.error(
-                "票档点击后的同一快照未能继续证明目标日期和城市，"
-                "已停止确定购买"
-            )
-            return False
-
-        proof = getattr(bot, "_verified_price_selection", None)
-        if not isinstance(proof, dict):
-            bot._set_terminal_failure("target_price_selection_unconfirmed")
-            return False
-        proof["selection_verified"] = True
-        proof["selection_source"] = "post_click_hierarchy"
-        proof["selection_observed_price"] = snapshot["observed_price"]
-
-        # Refresh the SKU stamp and buy-button coordinate from the same
-        # post-click hierarchy.  Selecting a card changes layout state, so
-        # retaining the pre-click stamp would make the next tap stale.
-        has_real_cache_api = callable(
-            getattr(type(bot), "_hot_layout_digest_from_xml", None)
-        )
-        if has_real_cache_api:
-            layout_digest = bot._hot_layout_digest_from_xml(xml_root, "sku")
-            bot._set_hot_cache_context(
-                scope="sku",
-                page_state="sku_page",
-                layout_digest=layout_digest,
-            )
-            bot._put_hot_coord(
-                "price",
-                cached_coords,
-                scope="sku",
-                page_state="sku_page",
-                layout_digest=layout_digest,
-            )
-            buy_coords = bot._get_buy_button_coordinates(xml_root=xml_root)
-            if buy_coords is not None:
-                bot._put_hot_coord(
-                    "sku_buy",
-                    buy_coords,
-                    scope="sku",
-                    page_state="sku_page",
-                    layout_digest=layout_digest,
-                )
-            proof["stamp"] = bot._cached_hot_path_coord_meta.get("price")
-            proof["selection_layout_digest"] = layout_digest
-        return True
-
-    def _unavailable_price_tag(self, texts):
-        """Return the first unavailable marker, including sentence variants."""
-        for candidate in texts or ():
-            value = candidate.strip() if isinstance(candidate, str) else ""
-            if value in _PRICE_UNAVAILABLE_TAGS or _PRICE_UNAVAILABLE_PATTERN.search(
-                value
-            ):
-                return value
-        return ""
-
-    def _price_option_tag(self, texts):
-        unavailable = self._unavailable_price_tag(texts)
-        if unavailable:
-            return unavailable
-        return next(
-            (
-                candidate.strip()
-                for candidate in texts or ()
-                if isinstance(candidate, str)
-                and candidate.strip() in _PRICE_OPTION_INFO_TAGS
-            ),
-            "",
-        )
+        target_digits = self._extract_price_digits(self._config.price)
+        text_digits = self._extract_price_digits(text)
+        return target_digits is not None and target_digits == text_digits
 
     def _is_price_option_available(self, option):
         """Return whether a visible price option is actually selectable."""
         tag = (option.get("tag") or "").strip()
-        return not (
-            tag in _PRICE_UNAVAILABLE_TAGS
-            or _PRICE_UNAVAILABLE_PATTERN.search(tag)
-        )
+        text = (option.get("text") or "").strip()
+        if tag in _PRICE_UNAVAILABLE_TAGS:
+            return False
+        return not any(item in text for item in _PRICE_UNAVAILABLE_TAGS)
+
+    def _tap_price_option(self, option, burst=False):
+        """Tap a recognized price card by its bounds, then by card index."""
+        bot = self._bot
+        bounds = option.get("bounds") if isinstance(option, dict) else None
+        if bounds and len(bounds) == 4:
+            left, top, right, bottom = bounds
+            x, y = (left + right) // 2, (top + bottom) // 2
+            if burst:
+                bot._burst_click_coordinates(
+                    x, y, count=2, interval_ms=25, duration=25
+                )
+            else:
+                bot._click_coordinates(x, y, duration=30)
+            return True
+        index = option.get("index") if isinstance(option, dict) else None
+        if index is None:
+            return False
+        return bool(bot._click_visible_price_option(index))
 
     def _click_visible_price_option(self, card_index):
         """Click a visible price card by its clickable-card index."""
@@ -740,20 +861,6 @@ class PriceSelector:
         ignore raw touch coordinates) and falls back to coordinate click.
         """
         bot = self._bot
-        if self._is_formal_commit():
-            # Formal mode may only click the coordinate proven by the same
-            # hierarchy snapshot.  Re-querying a live list by index creates a
-            # TOCTOU window if cards reorder while inventory updates.
-            if not coords:
-                return False
-            # One click only: a second blind coordinate tap can land on a
-            # reordered card while inventory is updating.
-            bot._click_coordinates(*coords, duration=30)
-            logger.info(
-                "通过同一票档快照坐标选择票价: price_index=%s",
-                self._config.price_index,
-            )
-            return True
         # Primary: element click — Damai price cards may not respond to coordinate taps
         if self._click_price_card_element(self._config.price_index):
             logger.info(
@@ -789,7 +896,9 @@ class PriceSelector:
                 className="android.widget.FrameLayout", clickable=True
             )
             if children.count > index:
-                children[index].click()
+                # u2 默认 waitForExists 是 20 秒。票档选择器对不上时，
+                # 这一次点击会把「选择票价」拖到二十多秒。
+                children[index].click(timeout=0.2)
                 return True
         except Exception:
             pass
@@ -833,60 +942,107 @@ class PriceSelector:
         return compound
 
     def _price_option_text_from_descendants(self, texts):
-        """Collapse descendant texts into a price label."""
-        if not texts:
+        """Collapse descendant texts into a price label, dropping status badges."""
+        label, _badge = split_label_and_badge(texts)
+        if not label:
             return ""
-
-        filtered = []
-        ignored = {"可预约", "预售", "无票", "已预约", "缺货", "惠", "荐", "热", "售罄"}
-        for text in texts:
-            value = text.strip()
-            if not value or value in ignored:
-                continue
-            filtered.append(value)
-
-        if not filtered:
-            return ""
-
-        merged = "".join(filtered)
-        if merged.isdigit():
-            return f"{merged}元"
-        if re.fullmatch(r"[\u4e00-\u9fffA-Za-z]+[0-9]{2,5}", merged):
-            return f"{merged}元"
-        if re.fullmatch(r"[0-9]{2,5}[A-Za-z\u4e00-\u9fff]+", merged):
-            return merged
-        return merged
+        if label.isdigit():
+            return f"{label}元"
+        if re.fullmatch(r"[\u4e00-\u9fffA-Za-z]+[0-9]{2,5}", label):
+            return f"{label}元" if not label.endswith("元") else label
+        if re.fullmatch(r"[0-9]{2,5}[A-Za-z\u4e00-\u9fff]+", label):
+            return label
+        return label
 
     def _select_price_option_fast(self, cached_coords=None):
         """Use config-driven, low-latency ticket selection before OCR-heavy fallbacks."""
         bot = self._bot
-        if self._is_formal_commit():
-            if not self._formal_cached_price_is_verified(
-                cached_coords, require_selected=False
+        if self._config.rush_mode and getattr(bot, "_sale_hot_path", False):
+            if bot._click_price_option_by_config_index(
+                burst=True, coords=cached_coords
             ):
-                bot._set_terminal_failure("target_price_unconfirmed")
-                logger.error(
-                    "正式模式缺少本轮同一 SKU 快照的票档文案证据，"
-                    "已禁止按坐标、索引或全页文本点击"
+                return True
+            return False
+        if self._config.rush_mode:
+            # 先按票价数字匹配（780 即可命中「内场780元」）。
+            # price_index 只在名称还没识别出来时兜底，不能拿缺货的第 0 档挡住 780。
+            preview = getattr(bot, "_visible_price_options", None)
+            if not preview:
+                xml_root = getattr(bot, "_sku_hierarchy_xml", None)
+                if xml_root is None and bot._using_u2():
+                    xml_root = bot._dump_hierarchy_xml()
+                if xml_root is not None:
+                    preview = (
+                        bot.get_visible_price_options(allow_ocr=False, xml_root=xml_root)
+                        or []
+                    )
+            if not preview:
+                preview = bot.get_visible_price_options(allow_ocr=False) or []
+            _burst = bool(self._config.if_commit_order or self._config.probe_only)
+            matched = [
+                option
+                for option in preview
+                if bot._price_text_matches_target(option.get("text") or "")
+            ]
+            if matched:
+                option = next(
+                    (
+                        item
+                        for item in matched
+                        if bot._is_price_option_available(item)
+                    ),
+                    matched[0],
+                )
+                if not bot._is_price_option_available(option):
+                    logger.warning(
+                        "目标票档当前不可选: %s [%s]，停止点击，不会进入确认页",
+                        option.get("text") or "(未识别档名)",
+                        option.get("tag") or "不可售",
+                    )
+                    return False
+                if self._tap_price_option(option, burst=_burst):
+                    logger.info(
+                        "通过票价匹配选择: %s (配置 %s)",
+                        option.get("text") or self._config.price,
+                        self._config.price,
+                    )
+                    return True
+                return False
+
+            indexed = next(
+                (
+                    option
+                    for option in preview
+                    if option.get("index") == self._config.price_index
+                ),
+                None,
+            )
+            label = (indexed or {}).get("text") or ""
+            if label and not bot._price_text_matches_target(label):
+                logger.warning(
+                    "列表中没有包含票价 %s 的档位（price_index=%s 是「%s」），停止点击",
+                    self._config.price,
+                    self._config.price_index,
+                    label,
                 )
                 return False
-            proof = getattr(bot, "_verified_price_selection", None)
-            if isinstance(proof, dict) and proof.get("selection_verified") is True:
-                logger.info("同一票档快照已确认目标票档处于选中状态，跳过重复点击")
-                return True
-            clicked = bot._click_price_option_by_config_index(
-                burst=False,
-                coords=cached_coords,
-            )
-            if not clicked:
-                bot._verified_price_selection = None
-                bot._set_terminal_failure("target_price_selection_unconfirmed")
+            if indexed is not None and not bot._is_price_option_available(indexed):
+                logger.warning(
+                    "目标票档当前不可选: %s [%s]，停止点击，不会进入确认页",
+                    label or "(未识别档名)",
+                    indexed.get("tag") or "不可售",
+                )
                 return False
-            return self._verify_formal_price_selection_after_click(cached_coords)
-
-        if self._config.rush_mode:
+            if indexed and indexed.get("bounds"):
+                if self._tap_price_option(indexed, burst=_burst):
+                    logger.info(
+                        "通过票档坐标选择: %s (price_index=%s)",
+                        label or self._config.price,
+                        self._config.price_index,
+                    )
+                    return True
             if bot._click_price_option_by_config_index(
-                burst=False, coords=cached_coords
+                burst=_burst, coords=cached_coords
             ):
                 return True
 
@@ -908,13 +1064,8 @@ class PriceSelector:
                         f"[{indexed_option.get('tag') or '不可售'}]"
                     )
                     return False
-                indexed_text = indexed_option.get("text") or ""
-                if (
-                    bool(indexed_text)
-                    and bot._price_text_matches_target(indexed_text)
-                ) or (
-                    not self._is_formal_commit()
-                    and not indexed_text
+                if not indexed_option.get("text") or bot._price_text_matches_target(
+                    indexed_option.get("text") or ""
                 ):
                     if bot._click_visible_price_option(indexed_option["index"]):
                         logger.info(
@@ -922,10 +1073,7 @@ class PriceSelector:
                             f"(price_index={self._config.price_index})"
                         )
                         return True
-            elif (
-                not self._is_formal_commit()
-                and bot._click_price_option_by_config_index()
-            ):
+            elif bot._click_price_option_by_config_index():
                 return True
 
             matched_options = [
@@ -992,19 +1140,7 @@ class PriceSelector:
                 ),
                 None,
             )
-            if (
-                indexed_option
-                and bot._is_price_option_available(indexed_option)
-                and (
-                    not self._is_formal_commit()
-                    or (
-                        bool(indexed_option.get("text"))
-                        and bot._price_text_matches_target(
-                            indexed_option.get("text") or ""
-                        )
-                    )
-                )
-            ):
+            if indexed_option and bot._is_price_option_available(indexed_option):
                 if bot._click_visible_price_option(indexed_option["index"]):
                     logger.info(
                         f"文本匹配未命中，使用当前可见票档索引选择: {indexed_option.get('text') or self._config.price} "
@@ -1023,13 +1159,24 @@ class PriceSelector:
             logger.info(f"通过文本匹配选择票价: {self._config.price}")
             return True
 
+        blocked = [
+            option
+            for option in visible_options
+            if option.get("index") == self._config.price_index
+            and not self._is_price_option_available(option)
+        ]
+        if blocked:
+            option = blocked[0]
+            logger.warning(
+                "目标票档当前不可选: %s [%s]，停止点击，不会进入确认页",
+                option.get("text") or "(未识别档名)",
+                option.get("tag") or "不可售",
+            )
+            return False
+
         logger.info(
             f"文本匹配失败，使用索引选择票价: price_index={self._config.price_index}"
         )
-        if self._is_formal_commit():
-            bot._set_terminal_failure("target_price_unconfirmed")
-            logger.error("目标票档文案仍未确认，正式模式停止")
-            return False
         logger.info(f"通过配置索引直接选择票价: price_index={self._config.price_index}")
         try:
             price_container = bot._find(
@@ -1046,9 +1193,44 @@ class PriceSelector:
                 )
                 clickable_cards = [card for card in cards if bot._is_clickable(card)]
                 if not (0 <= self._config.price_index < len(clickable_cards)):
-                    logger.warning(
-                        f"price_index={self._config.price_index} 超出可点击卡片数量 {len(clickable_cards)}"
+                    # 票档面板可能尚未渲染完成（issue #61 的 0 卡片失败）：
+                    # 短暂等待后重查一次，再失败则给出可行动的诊断信息。
+                    time.sleep(0.6)
+                    cards = bot._container_find_elements(
+                        price_container, By.CLASS_NAME, "android.widget.FrameLayout"
                     )
+                    clickable_cards = [card for card in cards if bot._is_clickable(card)]
+                if not (0 <= self._config.price_index < len(clickable_cards)):
+                    if not clickable_cards:
+                        hint_marks = (
+                            "去选座",
+                            "每次限",
+                            "缺货登记",
+                            "选座购买",
+                            "预约想看",
+                        )
+                        hints = [
+                            text
+                            for text in hint_marks
+                            if bot._has_element(
+                                ANDROID_UIAUTOMATOR,
+                                f'new UiSelector().textContains("{text}")',
+                            )
+                        ]
+                        if hints:
+                            logger.error(
+                                "票档容器内无可点击卡片：当前为 %s 流程，标准票档选择不适用",
+                                "/".join(hints),
+                            )
+                        else:
+                            logger.error(
+                                "票档容器内无可点击卡片（price_index=%s），票档面板可能未加载完成",
+                                self._config.price_index,
+                            )
+                    else:
+                        logger.warning(
+                            f"price_index={self._config.price_index} 超出可点击卡片数量 {len(clickable_cards)}"
+                        )
                     return False
                 target_price = clickable_cards[self._config.price_index]
             bot._click_element_center(target_price, duration=30)
@@ -1340,7 +1522,7 @@ class PriceSelector:
             texts = bot._collect_descendant_texts(card, xml_root=cached_xml_root)
             text = self._price_option_text_from_descendants(texts)
             source = "ui" if text else ""
-            tag = self._price_option_tag(texts)
+            _label, tag = split_label_and_badge(texts)
             card_data.append(
                 {
                     "index": index,
@@ -1413,19 +1595,14 @@ class PriceSelector:
         if not container_bounds:
             return []
 
-        # Direct children that are clickable FrameLayouts = price cards.
-        card_nodes = [
-            child
-            for child in price_container_node
-            if child.get("class") == "android.widget.FrameLayout"
-            and child.get("clickable") == "true"
-        ]
+        # 整张票档（ViewGroup 或 FrameLayout）。内嵌的「缺货登记」小标签不算一张票。
+        card_nodes = flow_item_cards(price_container_node)
         if not card_nodes:
             return []
 
-        # Screenshot for OCR (one shot).
+        # 票档名经常是自绘，不在 text 里。允许 OCR 时截一张图补名称。
         screenshot_path = None
-        if allow_ocr and _MAGICK_BIN and _TESSERACT_BIN:
+        if allow_ocr and hasattr(bot, "d") and hasattr(bot.d, "screenshot"):
             try:
                 with tempfile.NamedTemporaryFile(
                     suffix=".png", delete=False
@@ -1435,75 +1612,37 @@ class PriceSelector:
             except Exception:
                 screenshot_path = None
 
-        card_data = []
-        ocr_tasks = []
+        options = []
         for index, card_node in enumerate(card_nodes):
-            # Collect all descendant texts directly from XML nodes.
-            texts: list[str] = []
-            seen: set[str] = set()
-            for desc in card_node.iter("node"):
-                text = (desc.get("text") or "").strip()
-                if text and text not in seen:
-                    texts.append(text)
-                    seen.add(text)
-
+            texts = node_visible_texts(card_node)
             price_text = self._price_option_text_from_descendants(texts)
+            _label, tag = split_label_and_badge(texts)
             source = "ui" if price_text else ""
-            tag = self._price_option_tag(texts)
-
             card_bounds = bot._parse_bounds(card_node.get("bounds", ""))
-            if not price_text and screenshot_path and card_bounds:
-                left, top, right, bottom = card_bounds
-                rect = {
-                    "x": left,
-                    "y": top,
-                    "width": right - left,
-                    "height": bottom - top,
-                }
-                ocr_tasks.append((index, rect))
-
-            card_data.append(
+            options.append(
                 {
                     "index": index,
                     "text": price_text,
                     "tag": tag,
                     "raw_texts": texts,
-                    "source": source,
+                    "source": source or "ui",
+                    "bounds": card_bounds,
+                    "ocr_bounds": label_bounds(card_node) or card_bounds,
                 }
             )
-
-        # Parallel OCR for cards whose price text wasn't in the UI tree.
-        ocr_results: dict[int, str] = {}
-        if ocr_tasks and screenshot_path:
-
-            def _run_ocr(args):
-                idx, rect = args
-                return idx, self._ocr_price_text_from_card(screenshot_path, rect)
-
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(len(ocr_tasks), 4)
-            ) as executor:
-                for idx, ocr_text in executor.map(_run_ocr, ocr_tasks):
-                    if ocr_text:
-                        ocr_results[idx] = ocr_text
-
-        options = []
-        for entry in card_data:
-            idx = entry["index"]
-            if not entry["text"] and idx in ocr_results:
-                entry["text"] = ocr_results[idx]
-                entry["source"] = "ocr"
-            if not entry["text"] and not entry["tag"]:
-                continue
-            options.append(
-                {
-                    "index": idx,
-                    "text": entry["text"],
-                    "tag": entry["tag"],
-                    "raw_texts": entry["raw_texts"],
-                    "source": entry["source"] or "ui",
-                }
+        if screenshot_path:
+            pending = [
+                item for item in options if not item["text"] and item.get("ocr_bounds")
+            ]
+            recognized = ocr_regions(
+                screenshot_path, [item["ocr_bounds"] for item in pending]
             )
+            for item, text in zip(pending, recognized):
+                if text:
+                    item["text"] = text
+                    item["source"] = "ocr"
+        for item in options:
+            item.pop("ocr_bounds", None)
 
         if screenshot_path and os.path.exists(screenshot_path):
             try:

@@ -259,8 +259,6 @@ class DelegatorsMixin:
         self._ensure_pipeline()
         return self._pipeline.run_warm_validation(start_time)
 
-    def _rush_preselect_and_buy_via_xml(self, *, dialogs_checked=False):
+    def _rush_preselect_and_buy_via_xml(self):
         self._ensure_pipeline()
-        return self._pipeline.rush_preselect_and_buy_via_xml(
-            dialogs_checked=dialogs_checked
-        )
+        return self._pipeline.rush_preselect_and_buy_via_xml()

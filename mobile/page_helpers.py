@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from mobile.page_probe import PageProbe
 
 logger = get_logger(__name__)
-_monotonic = time.monotonic
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +171,7 @@ def wait_for_home_ready(
         HomeNotReadyError: When the homepage state is not detected before
             ``timeout`` elapses.
     """
-    deadline = _monotonic() + max(0.0, float(timeout))
+    deadline = time.time() + max(0.0, float(timeout))
     last_result: Optional[Dict[str, Any]] = None
     while True:
         try:
@@ -183,7 +182,7 @@ def wait_for_home_ready(
         state = (last_result or {}).get("state")
         if state == "homepage":
             return last_result
-        if _monotonic() >= deadline:
+        if time.time() >= deadline:
             break
         time.sleep(poll_interval)
 
@@ -292,13 +291,13 @@ def select_search_result(
         SearchEmptyError: No result cards visible after ``timeout`` seconds.
         SearchAmbiguousError: ``strict=True`` and N>1 with no fuzzy match.
     """
-    deadline = _monotonic() + max(0.0, float(timeout))
+    deadline = time.time() + max(0.0, float(timeout))
     results: List[Dict[str, Any]] = []
     while True:
         results = _enumerate_search_results_from_xml(_safe_dump_hierarchy(driver))
         if results:
             break
-        if _monotonic() >= deadline:
+        if time.time() >= deadline:
             break
         time.sleep(poll_interval)
 

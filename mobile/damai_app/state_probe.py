@@ -72,6 +72,57 @@ class StateProbeMixin:
 
         return any(self._has_element(by, value) for by, value in reservation_indicators)
 
+    def _bottom_bar_point(self):
+        """详情页购票栏和票档页底部按钮都盖住这块区域。不读控件边界。"""
+        size = getattr(self, "_screen_size", None)
+        if not size:
+            try:
+                width, height = self.d.window_size()
+                size = (int(width), int(height))
+            except Exception:
+                return None
+            if size[0] <= 0 or size[1] <= 0:
+                return None
+            self._screen_size = size
+        return (size[0] // 2, size[1] - 100)
+
+    def _sku_price_title(self):
+        """读票档标题。直接取文字，不走会再等一遍控件出现的 get_text。"""
+        if not self._using_u2():
+            return ""
+        try:
+            selector = self.d(resourceId="cn.damai:id/tv_price_name").selector
+            return self.d.jsonrpc.getText(selector) or ""
+        except Exception:
+            return ""
+
+    def _reservation_marker_visible(self):
+        """票档页上的预约标题。一次存在查询，不读整页界面树。"""
+        title = self._sku_price_title()
+        if "预约想看" in title:
+            return True
+        for text in ("预约想看票档", "预约想看场次"):
+            if self._has_element(
+                ANDROID_UIAUTOMATOR, f'new UiSelector().text("{text}")'
+            ):
+                return True
+        return False
+
+    def reservation_marked_in_xml(self, xml_root):
+        """从一次界面树判断是不是预约页，避免连打多个选择器。"""
+        if xml_root is None:
+            return False
+        for node in xml_root.iter("node"):
+            if (node.get("resource-id") or "") == "cn.damai:id/btn_cancel_reservation":
+                return True
+            blob = f"{node.get('text') or ''}{node.get('content-desc') or ''}"
+            if any(
+                token in blob
+                for token in ("预约想看场次", "预约想看票档", "提交抢票预约")
+            ):
+                return True
+        return False
+
     def get_visible_date_options(self, xml_root=None):
         """Return visible date options on the current page."""
         if xml_root is not None and self._using_u2():
@@ -94,6 +145,85 @@ class StateProbeMixin:
             dates.append(text)
             seen.add(text)
         return dates
+
+    def get_visible_session_options(self, xml_root=None, allow_ocr=False):
+        """场次卡片。新版 SKU 用 perform_flowlayout，日期文字经常不在 text 属性里。"""
+        import os
+
+        from mobile.price_selector import (
+            flow_item_cards,
+            label_bounds,
+            node_visible_texts,
+            ocr_regions,
+            split_label_and_badge,
+        )
+
+        if xml_root is None and self._using_u2():
+            xml_root = self._dump_hierarchy_xml()
+
+        options = []
+        container = None
+        if xml_root is not None:
+            for node in xml_root.iter("node"):
+                if node.get("resource-id") == "cn.damai:id/project_detail_perform_flowlayout":
+                    container = node
+                    break
+        if container is not None:
+            for index, card in enumerate(flow_item_cards(container)):
+                label, badge = split_label_and_badge(node_visible_texts(card))
+                options.append(
+                    {
+                        "index": index,
+                        "text": label,
+                        "tag": badge,
+                        "bounds": label_bounds(card),
+                    }
+                )
+
+        if not options:
+            for index, date_text in enumerate(
+                self.get_visible_date_options(xml_root=xml_root) or []
+            ):
+                options.append(
+                    {"index": index, "text": date_text, "tag": "", "bounds": None}
+                )
+
+        if allow_ocr and any(not item["text"] and item.get("bounds") for item in options):
+            screenshot_path = self._save_ocr_screenshot()
+            if screenshot_path:
+                try:
+                    pending = [
+                        item for item in options if not item["text"] and item.get("bounds")
+                    ]
+                    recognized = ocr_regions(
+                        screenshot_path, [item["bounds"] for item in pending]
+                    )
+                    for item, text in zip(pending, recognized):
+                        if text:
+                            item["text"] = text
+                finally:
+                    try:
+                        os.remove(screenshot_path)
+                    except OSError:
+                        pass
+        return options
+
+    def _save_ocr_screenshot(self):
+        import os
+        import tempfile
+
+        if not self._using_u2() or not hasattr(self, "d"):
+            return None
+        screenshot = getattr(self.d, "screenshot", None)
+        if not callable(screenshot):
+            return None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
+                path = tmp_file.name
+            screenshot(path)
+            return path
+        except Exception:
+            return None
 
     def _get_detail_venue_text(self, xml_root=None):
         """Read venue text from the detail page if present."""
@@ -251,7 +381,7 @@ class StateProbeMixin:
             By.ID, "cn.damai:id/header_search_v2_input"
         ):
             state = "search_page"
-        elif submit_button:
+        elif submit_button or "DmOrder" in current_activity:
             state = "order_confirm_page"
         elif (
             "NcovSkuActivity" in current_activity
