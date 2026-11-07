@@ -467,27 +467,16 @@ class DamaiBot(
         return False
 
     def _click_sku_buy_button_element(self, burst_count=1):
-        """Fallback to an element click for Damai's custom SKU buy button."""
+        """点票档页右侧「确定」。与详情页「立即预订」一样只走坐标点击。"""
         try:
             buy_button = self._find(By.ID, "cn.damai:id/btn_buy_view")
         except Exception:
             return False
-
-        click_action = getattr(buy_button, "click", None)
-        if not callable(click_action):
+        if not self._selector_exists(buy_button):
             return False
-
-        for attempt in range(max(1, int(burst_count))):
-            try:
-                click_action(timeout=0.12)
-            except TypeError:
-                click_action()
-            except Exception:
-                if attempt == 0:
-                    return False
-            if attempt < burst_count - 1:
-                time.sleep(0.03)
-        return True
+        return self._tap_element_center_coordinates(
+            buy_button, burst_count=burst_count, duration=25, interval_ms=25
+        )
 
     # ------------------------------------------------------------------
     # Failure diagnostics (P1 #31)
@@ -625,14 +614,7 @@ class DamaiBot(
             return False
         if not self._selector_exists(button):
             return False
-        click_action = getattr(button, "click", None)
-        if not callable(click_action):
-            return False
-        try:
-            click_action(timeout=0.12)
-        except TypeError:
-            click_action()
-        return True
+        return self._tap_element_center_coordinates(button, burst_count=1)
 
     def _hammer_reservation_bottom_button(self):
         """预约流程里持续高频点击底部按钮，直到离开预约页或进入确认页。"""
@@ -660,9 +642,7 @@ class DamaiBot(
             elif not clicked:
                 try:
                     button = self._d(resourceId="cn.damai:id/btn_buy_view")
-                    if button.exists:
-                        button.click(timeout=0.15)
-                    else:
+                    if not self._tap_element_center_coordinates(button):
                         self.ultra_fast_click(
                             By.ID, "cn.damai:id/btn_buy_view", timeout=0.15
                         )

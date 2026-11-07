@@ -216,6 +216,27 @@ class UIPrimitives:
             if attempt < count - 1 and interval_ms > 0:
                 time.sleep(interval_ms / 1000)
 
+    def _tap_element_center_coordinates(
+        self, element, burst_count=1, duration=25, interval_ms=25
+    ):
+        """点元素中心。与详情页「立即预订」相同，只走坐标点击。"""
+        try:
+            rect = self._element_rect(element)
+        except Exception:
+            return False
+        if rect["width"] <= 0 or rect["height"] <= 0:
+            return False
+        x = rect["x"] + rect["width"] // 2
+        y = rect["y"] + rect["height"] // 2
+        count = max(1, int(burst_count))
+        if count == 1:
+            self._click_coordinates(x, y, duration=duration)
+        else:
+            self._burst_click_coordinates(
+                x, y, count=count, interval_ms=interval_ms, duration=duration
+            )
+        return True
+
     def ultra_fast_click(self, by, value, timeout=1.5):
         """超快速点击 - 适合抢票场景"""
         try:

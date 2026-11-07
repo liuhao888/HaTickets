@@ -2249,14 +2249,25 @@ class TestPageStateHelpers:
         with patch.object(bot, "_has_any_element", return_value=False):
             assert bot._wait_for_submit_ready(timeout=0.01, poll_interval=0) is False
 
-    def test_click_sku_buy_button_element_uses_element_click(self, bot):
+    def test_click_sku_buy_button_element_uses_coordinate_click(self, bot):
         button = Mock()
-        button.click = Mock()
+        button.info = {
+            "bounds": {"left": 666, "top": 2184, "right": 1017, "bottom": 2316}
+        }
 
         with patch.object(bot, "_find", return_value=button):
-            assert bot._click_sku_buy_button_element() is True
+            with patch.object(bot, "_selector_exists", return_value=True):
+                with patch.object(bot, "_burst_click_coordinates") as tap:
+                    assert bot._click_sku_buy_button_element(burst_count=2) is True
 
-        button.click.assert_called_once()
+        button.click.assert_not_called()
+        tap.assert_called_once_with(
+            (666 + 1017) // 2,
+            (2184 + 2316) // 2,
+            count=2,
+            interval_ms=25,
+            duration=25,
+        )
 
     def test_click_sku_buy_button_element_returns_false_when_missing(self, bot):
         with patch.object(bot, "_find", side_effect=RuntimeError("missing")):
@@ -4721,6 +4732,69 @@ class TestXmlHierarchyHelpers:
 
 
 class TestPriceSelection:
+    def test_config_index_taps_given_coordinates(self, bot):
+        with patch.object(bot, "_burst_click_coordinates") as burst:
+            with patch.object(bot._price_sel, "_click_price_card_element") as card:
+                assert bot._click_price_option_by_config_index(
+                    burst=True, coords=(120, 340)
+                )
+
+        card.assert_not_called()
+        burst.assert_called_once_with(120, 340, count=2, interval_ms=25, duration=25)
+
+    def test_price_card_uses_coordinate_click(self, bot):
+        card = Mock()
+        card.click = Mock()
+        card.info = {
+            "bounds": {"left": 63, "top": 1053, "right": 435, "bottom": 1224}
+        }
+
+        class _Children:
+            count = 6
+
+            def __getitem__(self, index):
+                return card
+
+        container = Mock()
+        container.exists = Mock(return_value=True)
+        container.child = Mock(return_value=_Children())
+        bot._price_sel._d = Mock(return_value=container)
+
+        with patch.object(bot, "_burst_click_coordinates") as tap:
+            assert bot._price_sel._click_price_card_element(0, burst=True) is True
+
+        card.click.assert_not_called()
+        tap.assert_called_once_with(
+            (63 + 435) // 2,
+            (1053 + 1224) // 2,
+            count=2,
+            interval_ms=25,
+            duration=25,
+        )
+
+    def test_hot_path_accepts_footer_price_when_index_is_out_of_range(self, bot):
+        """12:00 实战：6 个票档时 price_index=6 点不中，但底部已经是 588。"""
+        bot.config.rush_mode = True
+        bot.config.if_commit_order = True
+        bot._sale_hot_path = True
+        bot.config.price = "588"
+        bot.config.price_index = 6
+        price = Mock()
+        price.exists = Mock(return_value=True)
+        price.get_text = Mock(return_value="588")
+        bot.d.side_effect = lambda **kwargs: price
+
+        with patch.object(
+            bot._price_sel, "_click_price_card_element", return_value=False
+        ):
+            with patch.object(bot, "_get_price_option_coordinates_by_config_index") as coords:
+                with patch.object(bot, "_dump_hierarchy_xml") as dump_xml:
+                    result = bot._click_price_option_by_config_index(burst=True)
+
+        assert result is True
+        coords.assert_not_called()
+        dump_xml.assert_not_called()
+
     def test_sale_hot_path_clicks_price_index_without_hierarchy_dump(self, bot):
         bot.config.rush_mode = True
         bot.config.if_commit_order = True
@@ -5967,6 +6041,27 @@ class TestRushPreSelectViaXml:
         assert result["reservation_mode"] is False
         title.assert_not_called()
         probe.assert_not_called()
+
+    def test_hot_submit_clicks_button_center_like_detail_buy(self, bot):
+        bot._sale_hot_path = True
+        button = Mock()
+        button.info = {
+            "bounds": {"left": 666, "top": 2100, "right": 1000, "bottom": 2300}
+        }
+        with patch.object(bot, "_find", return_value=button):
+            with patch.object(bot, "_selector_exists", return_value=True):
+                with patch.object(bot, "_click_coordinates") as tap:
+                    with patch.object(
+                        bot, "_verify_order_result_hot", return_value="success"
+                    ):
+                        result = bot._submit_order_fast(
+                            [(By.ID, "cn.damai:id/submit")]
+                        )
+
+        assert result == "success"
+        tap.assert_called_once_with(
+            (666 + 1000) // 2, (2100 + 2300) // 2, duration=25
+        )
 
     def test_hot_submit_clicks_bottom_point_without_title(self, bot):
         bot._sale_hot_path = True

@@ -855,54 +855,101 @@ class PriceSelector:
         return False
 
     def _click_price_option_by_config_index(self, burst=False, coords=None):
-        """Click the configured price card index directly without reading ticket texts.
+        """Click the configured price card by screen coordinate.
 
-        Prefers element-based click (works with Damai's custom Views that
-        ignore raw touch coordinates) and falls back to coordinate click.
+        与详情页「立即预订」相同，只走 ``_click_coordinates``。票档卡片的
+        clickable 经常为 false，节点 click() 点不中。
         """
         bot = self._bot
-        # Primary: element click — Damai price cards may not respond to coordinate taps
-        if self._click_price_card_element(self._config.price_index):
+        if coords:
+            self._tap_point(coords, burst=burst)
             logger.info(
                 f"通过配置索引直接选择票价: price_index={self._config.price_index}"
             )
             return True
-        # Fallback: coordinate click
-        target_coords = coords or bot._get_price_option_coordinates_by_config_index()
+        if self._click_price_card_element(self._config.price_index, burst=burst):
+            logger.info(
+                f"通过配置索引直接选择票价: price_index={self._config.price_index}"
+            )
+            return True
+        if self._footer_price_matches_target():
+            logger.info(
+                "底部价格已是目标票档 %s，跳过票档点击", self._config.price
+            )
+            return True
+        target_coords = bot._get_price_option_coordinates_by_config_index()
         if not target_coords:
             return False
-        if burst:
-            bot._burst_click_coordinates(
-                *target_coords, count=2, interval_ms=25, duration=25
-            )
-        else:
-            bot._click_coordinates(*target_coords, duration=30)
+        self._tap_point(target_coords, burst=burst)
         logger.info(f"通过配置索引直接选择票价: price_index={self._config.price_index}")
         return True
 
-    def _click_price_card_element(self, index):
-        """Click price card by element (Accessibility) rather than coordinate.
+    def _tap_point(self, coords, burst=False):
+        bot = self._bot
+        if burst:
+            bot._burst_click_coordinates(
+                *coords, count=2, interval_ms=25, duration=25
+            )
+        else:
+            bot._click_coordinates(*coords, duration=25)
 
-        Some Damai App custom Views only respond to Accessibility clicks,
-        not raw touch coordinates.
-        """
+    def _footer_price_matches_target(self):
+        """底部 ¥ 价格已经是配置票价时，不必再点一张不存在的票档。"""
+        bot = self._bot
+        if not bot._using_u2():
+            return False
+        try:
+            node = bot.d(resourceId="cn.damai:id/tv_price")
+            exists = getattr(node, "exists", None)
+            if callable(exists):
+                try:
+                    present = bool(exists(timeout=0))
+                except TypeError:
+                    present = bool(exists())
+            else:
+                present = bool(exists)
+            if not present:
+                return False
+            get_text = getattr(node, "get_text", None)
+            text = get_text(timeout=0) if callable(get_text) else ""
+        except Exception:
+            return False
+        return bool(text) and self._price_text_matches_target(str(text))
+
+    def _click_price_card_element(self, index, burst=False):
+        """按票档中心坐标点击，不调用节点 click()。"""
+        bot = self._bot
         try:
             container = self._d(
                 resourceId="cn.damai:id/project_detail_perform_price_flowlayout"
             )
-            if not container.exists:
+            exists = getattr(container, "exists", None)
+            if callable(exists):
+                try:
+                    present = bool(exists(timeout=0))
+                except TypeError:
+                    present = bool(exists())
+            else:
+                present = bool(exists)
+            if not present:
                 return False
             children = container.child(
                 className="android.widget.FrameLayout", clickable=True
             )
-            if children.count > index:
-                # u2 默认 waitForExists 是 20 秒。票档选择器对不上时，
-                # 这一次点击会把「选择票价」拖到二十多秒。
-                children[index].click(timeout=0.2)
-                return True
+            if not (children.count > index >= 0):
+                children = container.child(clickable=True)
+            if not (children.count > index >= 0):
+                return False
+            return bool(
+                bot._tap_element_center_coordinates(
+                    children[index],
+                    burst_count=2 if burst else 1,
+                    duration=25,
+                    interval_ms=25,
+                )
+            )
         except Exception:
-            pass
-        return False
+            return False
 
     def _build_compound_price_text(self, container):
         """Build a human-readable price string from split price fields."""

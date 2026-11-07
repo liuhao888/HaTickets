@@ -188,6 +188,19 @@ class PurchaseFlowMixin:
                 return None
             time.sleep(0.02)
 
+    def _click_labeled_button_coordinates(self, selectors):
+        """按按钮边界中心坐标点击，点击方式和详情页「立即预订」一致。"""
+        for by, value in selectors or ():
+            try:
+                element = self._find(by, value)
+            except Exception:
+                continue
+            if not self._selector_exists(element):
+                continue
+            if self._tap_element_center_coordinates(element, duration=25):
+                return True
+        return False
+
     def _click_bottom_bar_point(self):
         """点屏幕底部购票区域。同一次坐标能点中详情页购票栏和票档页底部按钮。"""
         point = self._bottom_bar_point()
@@ -207,14 +220,7 @@ class PurchaseFlowMixin:
             return False
         if not self._selector_exists(bar):
             return False
-        click_action = getattr(bar, "click", None)
-        if not callable(click_action):
-            return False
-        try:
-            click_action(timeout=0.15)
-        except TypeError:
-            click_action()
-        return True
+        return self._tap_element_center_coordinates(bar, duration=25)
 
     def _wait_detail_hot_entry(self):
         """点完只查一次 Activity。正式抢票走确认按钮，不把票档页当成预约页。"""
@@ -237,7 +243,9 @@ class PurchaseFlowMixin:
             t0 = time.monotonic()
             attempt_count = 3
             for attempt in range(attempt_count):
-                self._click_bottom_bar_point()
+                # 「立即提交」和票档页「确定」一样偏右。先点按钮中心，找不到再点底部栏。
+                if not self._click_labeled_button_coordinates(submit_selectors):
+                    self._click_bottom_bar_point()
                 result = self._verify_order_result_hot(timeout=0.2)
                 if result != "timeout":
                     log_event(
