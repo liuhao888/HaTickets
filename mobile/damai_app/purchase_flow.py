@@ -16,9 +16,9 @@ from . import (
 )
 
 try:
-    from mobile.logger import log_event
+    from mobile.logger import log_event, log_strategy, log_wait
 except ImportError:  # pragma: no cover
-    from logger import log_event  # type: ignore[no-redef]
+    from logger import log_event, log_strategy, log_wait  # type: ignore[no-redef]
 
 try:
     from mobile.ui_primitives import ANDROID_UIAUTOMATOR
@@ -178,15 +178,32 @@ class PurchaseFlowMixin:
 
     def _poll_purchase_entry_by_activity(self, timeout=0.7):
         """点进场次页后只读 Activity。没进场次页或确认页就返回空，避免在详情页上选票。"""
-        deadline = time.monotonic() + timeout
-        while True:
-            last = self._wait_detail_hot_entry()
-            state = (last or {}).get("state")
-            if state in {"sku_page", "order_confirm_page"}:
-                return last
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(0.02)
+        t0 = time.monotonic()
+        planned_ms = int(max(0.0, float(timeout)) * 1000)
+        last = None
+        state = None
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                last = self._wait_detail_hot_entry()
+                state = (last or {}).get("state")
+                if state in {"sku_page", "order_confirm_page"}:
+                    return last
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.02)
+        finally:
+            waited_ms = int((time.monotonic() - t0) * 1000)
+            log_wait(
+                logger,
+                kind="purchase_entry_poll",
+                waited_ms=waited_ms,
+                planned_ms=planned_ms,
+                state=state or "timeout",
+                level=logging.DEBUG
+                if state in {"sku_page", "order_confirm_page"} and waited_ms < 100
+                else logging.INFO,
+            )
 
     def _click_labeled_button_coordinates(self, selectors):
         """按按钮边界中心坐标点击，点击方式和详情页「立即预订」一致。"""
@@ -208,6 +225,59 @@ class PurchaseFlowMixin:
             return False
         self._click_coordinates(*point, duration=25)
         return True
+
+    def _click_right_bottom_bar_point(self, burst_count=1):
+        """固定相对坐标点票档「确定」或确认页「立即提交」，不查控件。"""
+        point = self._right_bottom_bar_point()
+        if point is None:
+            return False
+        if burst_count > 1:
+            self._burst_click_coordinates(
+                *point, count=burst_count, interval_ms=25, duration=25
+            )
+        else:
+            self._click_coordinates(*point, duration=25)
+        return True
+
+    # 「抢票人数太多」弹窗主按钮；勿点下方「返回重新选购」。
+    _SUBMIT_BUSY_RETRY_SELECTORS = (
+        (ANDROID_UIAUTOMATOR, 'new UiSelector().text("继续尝试")'),
+        (ANDROID_UIAUTOMATOR, 'new UiSelector().textContains("继续尝试")'),
+    )
+
+    # 弹窗主按钮大约在屏幕垂直中部；相对坐标兜底，避免元素查找过慢。
+    _SUBMIT_BUSY_RETRY_RELATIVE = (0.50, 0.58)
+
+    def _submit_busy_retry_point(self):
+        """人数过多弹窗「继续尝试」的固定相对坐标。"""
+        size = self._screen_size_tuple()
+        if not size:
+            return None
+        rx, ry = self._SUBMIT_BUSY_RETRY_RELATIVE
+        return (int(size[0] * rx), int(size[1] * ry))
+
+    def _click_submit_busy_retry_dialog(self):
+        """点确认页「人数过多」弹窗的「继续尝试」。出现则点，否则返回 False。"""
+        for by, value in self._SUBMIT_BUSY_RETRY_SELECTORS:
+            if not self._has_element(by, value):
+                continue
+            if self._click_labeled_button_coordinates(((by, value),)):
+                return True
+            if self.ultra_fast_click(by, value, timeout=0.15):
+                return True
+        # 文案可见但坐标点击失败时，用相对坐标再打一次。
+        if self._has_element(
+            ANDROID_UIAUTOMATOR,
+            'new UiSelector().textContains("抢票人数太多")',
+        ) or self._has_element(
+            ANDROID_UIAUTOMATOR,
+            'new UiSelector().text("继续尝试")',
+        ):
+            point = self._submit_busy_retry_point()
+            if point is not None:
+                self._click_coordinates(*point, duration=25)
+                return True
+        return False
 
     def _click_detail_purchase_bar(self):
         """点详情页底部购票栏，不读整页界面树。"""
@@ -237,98 +307,114 @@ class PurchaseFlowMixin:
             return {"state": "detail_page"}
         return self.probe_current_page(fast=True)
 
-    def _submit_order_fast(self, submit_selectors):
-        """Attempt submit quickly and retry within the confirm page before falling back."""
+    def _tap_submit_once(self, submit_selectors):
+        """点一次「立即提交」：热路径右下坐标，其它路径走文案/选择器。"""
         if getattr(self, "_sale_hot_path", False):
-            t0 = time.monotonic()
-            attempt_count = 3
-            for attempt in range(attempt_count):
-                # 「立即提交」和票档页「确定」一样偏右。先点按钮中心，找不到再点底部栏。
-                if not self._click_labeled_button_coordinates(submit_selectors):
-                    self._click_bottom_bar_point()
-                result = self._verify_order_result_hot(timeout=0.2)
-                if result != "timeout":
-                    log_event(
-                        logger,
-                        "order_submitted",
-                        success=result == "success",
-                        result=result,
-                        attempts=attempt + 1,
-                        duration_ms=int((time.monotonic() - t0) * 1000),
-                    )
-                    return result
-                if attempt < attempt_count - 1:
-                    logger.info(
-                        "支付页尚未出现，继续点击立即提交 %d/%d",
-                        attempt + 2,
-                        attempt_count,
-                    )
-            log_event(
-                logger,
-                "order_submitted",
-                level=logging.WARNING,
-                success=False,
-                result="timeout",
-                attempts=attempt_count,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-            )
-            return "timeout"
+            if self._click_right_bottom_bar_point():
+                return "right_bottom_bar_point"
+            if self._click_labeled_button_coordinates(submit_selectors):
+                return "labeled_button_coords"
+            self._click_bottom_bar_point()
+            return "bottom_bar_point"
 
-        attempt_count = 3
-        has_submitted_once = False
+        if submit_selectors and self.ultra_fast_click(
+            *submit_selectors[0], timeout=0.35
+        ):
+            return "ultra_fast_primary"
+        if (
+            submit_selectors
+            and len(submit_selectors) > 1
+            and self.ultra_fast_click(*submit_selectors[1], timeout=0.35)
+        ):
+            return "ultra_fast_secondary"
+        if submit_selectors and self.smart_wait_and_click(
+            *submit_selectors[0], submit_selectors[1:], timeout=0.6
+        ):
+            return "smart_wait"
+        return None
+
+    def _submit_order_fast(self, submit_selectors):
+        """提交确认页订单；遇「人数过多」弹窗则连点「继续尝试」直到进支付页。"""
+        # 安全上限，避免真·死循环；人数过多场景下会持续点「继续尝试」。
+        deadline_s = 180.0
         t0 = time.monotonic()
-        for attempt in range(attempt_count):
-            submit_success = False
-            if self.ultra_fast_click(*submit_selectors[0], timeout=0.35):
-                submit_success = True
-            elif self.ultra_fast_click(*submit_selectors[1], timeout=0.35):
-                submit_success = True
-            elif self.smart_wait_and_click(
-                *submit_selectors[0], submit_selectors[1:], timeout=0.6
-            ):
-                submit_success = True
+        deadline = t0 + deadline_s
+        attempt = 0
+        busy_clicks = 0
+        has_submitted_once = False
+        hot = getattr(self, "_sale_hot_path", False)
 
-            if not submit_success:
-                logger.warning("提交订单按钮未找到，请手动确认订单状态")
-                if has_submitted_once:
-                    followup_result = self.verify_order_result(timeout=2)
-                    if followup_result != "timeout":
+        while time.monotonic() < deadline:
+            attempt += 1
+            tap_t0 = time.monotonic()
+
+            if self._click_submit_busy_retry_dialog():
+                busy_clicks += 1
+                log_strategy(
+                    logger,
+                    action="submit_order",
+                    strategy="busy_retry_continue",
+                    attempt=attempt,
+                    busy_clicks=busy_clicks,
+                    duration_ms=int((time.monotonic() - tap_t0) * 1000),
+                )
+                if busy_clicks == 1 or busy_clicks % 5 == 0:
+                    logger.info(
+                        "检测到人数过多弹窗，点击继续尝试（第 %d 次）",
+                        busy_clicks,
+                    )
+            else:
+                strategy = self._tap_submit_once(submit_selectors)
+                if strategy is None:
+                    if not has_submitted_once and not busy_clicks:
+                        logger.warning("提交订单按钮未找到，请手动确认订单状态")
                         log_event(
                             logger,
                             "order_submitted",
-                            success=followup_result not in ("timeout", "failed"),
-                            result=followup_result,
-                            attempts=attempt + 1,
+                            level=logging.WARNING,
+                            success=False,
+                            result="button_not_found",
+                            attempts=attempt,
                             duration_ms=int((time.monotonic() - t0) * 1000),
                         )
-                        return followup_result
-                log_event(
+                        return "timeout"
+                    # 已点过提交/继续尝试：再等一轮结果，不立刻放弃。
+                    strategy = "wait_result"
+                else:
+                    has_submitted_once = True
+                log_strategy(
                     logger,
-                    "order_submitted",
-                    level=logging.WARNING,
-                    success=False,
-                    result="button_not_found",
-                    attempts=attempt + 1,
-                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    action="submit_order",
+                    strategy=strategy,
+                    attempt=attempt,
+                    busy_clicks=busy_clicks,
+                    duration_ms=int((time.monotonic() - tap_t0) * 1000),
                 )
-                return "timeout"
 
-            has_submitted_once = True
-            verify_timeout = 1.2 if attempt < attempt_count - 1 else 3
-            result = self.verify_order_result(timeout=verify_timeout)
+            verify_timeout = 0.45 if hot else (1.2 if attempt < 3 else 2.0)
+            if hot:
+                result = self._verify_order_result_hot(timeout=verify_timeout)
+            else:
+                result = self.verify_order_result(timeout=verify_timeout)
             if result != "timeout":
                 log_event(
                     logger,
                     "order_submitted",
                     success=result not in ("timeout", "failed"),
                     result=result,
-                    attempts=attempt + 1,
+                    attempts=attempt,
+                    busy_clicks=busy_clicks,
                     duration_ms=int((time.monotonic() - t0) * 1000),
                 )
                 return result
-            logger.warning(
-                f"提交后暂未确认结果，快速重试提交 {attempt + 2}/{attempt_count}"
-            )
+
+            # 验证窗口内可能刚弹出人数过多；下一轮优先点「继续尝试」。
+            if attempt == 1 or attempt % 10 == 0:
+                logger.info(
+                    "支付页尚未出现，继续提交/重试 %d（已点继续尝试 %d 次）",
+                    attempt + 1,
+                    busy_clicks,
+                )
 
         log_event(
             logger,
@@ -336,7 +422,8 @@ class PurchaseFlowMixin:
             level=logging.WARNING,
             success=False,
             result="timeout",
-            attempts=attempt_count,
+            attempts=attempt,
+            busy_clicks=busy_clicks,
             duration_ms=int((time.monotonic() - t0) * 1000),
         )
         return "timeout"

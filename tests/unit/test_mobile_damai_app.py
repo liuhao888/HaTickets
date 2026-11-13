@@ -4742,6 +4742,54 @@ class TestPriceSelection:
         card.assert_not_called()
         burst.assert_called_once_with(120, 340, count=2, interval_ms=25, duration=25)
 
+    def test_sale_hot_path_falls_through_to_text_match_when_index_misses(self, bot):
+        """正式抢票索引点不中时，不能直接 False，要继续票价文本匹配。"""
+        bot.config.rush_mode = True
+        bot.config.if_commit_order = True
+        bot._sale_hot_path = True
+        bot.config.price = "588"
+        bot.config.price_index = 6
+        bot._visible_price_options = [
+            {
+                "index": 0,
+                "text": "588元 (看台)",
+                "tag": "",
+                "bounds": (63, 1053, 435, 1224),
+            }
+        ]
+
+        with patch.object(
+            bot, "_click_price_option_by_config_index", return_value=False
+        ):
+            with patch.object(bot, "_burst_click_coordinates") as burst:
+                result = bot._select_price_option_fast()
+
+        assert result is True
+        burst.assert_called_once()
+
+    def test_price_coords_from_xml_accepts_viewgroup_cards(self, bot):
+        xml = (
+            "<hierarchy>"
+            '<node resource-id="cn.damai:id/project_detail_perform_price_flowlayout" '
+            'bounds="[0,1000][1080,2000]">'
+            '<node class="android.view.ViewGroup" clickable="true" '
+            'bounds="[63,1100][435,1270]">'
+            '<node text="588元 (看台)"/>'
+            "</node>"
+            '<node class="android.view.ViewGroup" clickable="true" '
+            'bounds="[462,1100][834,1270]">'
+            '<node text="888元 (看台)"/>'
+            "</node>"
+            "</node></hierarchy>"
+        )
+        bot.config.price = "588"
+        bot.config.price_index = 0
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(xml)
+        coords = bot._price_sel._get_price_coords_from_xml(root)
+        assert coords == ((63 + 435) // 2, (1100 + 1270) // 2)
+
     def test_price_card_uses_coordinate_click(self, bot):
         card = Mock()
         card.click = Mock()
@@ -5042,12 +5090,13 @@ class TestPriceSelection:
             (By.XPATH, '//*[contains(@text,"提交")]'),
         ]
 
-        with patch.object(bot, "ultra_fast_click", side_effect=[True, True]):
-            with patch.object(bot, "smart_wait_and_click", return_value=False):
-                with patch.object(
-                    bot, "verify_order_result", side_effect=["timeout", "success"]
-                ) as verify_result:
-                    result = bot._submit_order_fast(submit_selectors)
+        with patch.object(bot, "_click_submit_busy_retry_dialog", return_value=False):
+            with patch.object(bot, "ultra_fast_click", side_effect=[True, True]):
+                with patch.object(bot, "smart_wait_and_click", return_value=False):
+                    with patch.object(
+                        bot, "verify_order_result", side_effect=["timeout", "success"]
+                    ) as verify_result:
+                        result = bot._submit_order_fast(submit_selectors)
 
         assert result == "success"
         assert verify_result.call_args_list == [call(timeout=1.2), call(timeout=1.2)]
@@ -5059,17 +5108,19 @@ class TestPriceSelection:
             (By.XPATH, '//*[contains(@text,"提交")]'),
         ]
 
-        with patch.object(bot, "ultra_fast_click", side_effect=[True, False, False]):
-            with patch.object(bot, "smart_wait_and_click", return_value=False):
-                with patch.object(
-                    bot,
-                    "verify_order_result",
-                    side_effect=["timeout", "existing_order"],
-                ) as verify_result:
-                    result = bot._submit_order_fast(submit_selectors)
+        with patch.object(bot, "_click_submit_busy_retry_dialog", return_value=False):
+            with patch.object(bot, "ultra_fast_click", side_effect=[True, False, False]):
+                with patch.object(bot, "smart_wait_and_click", return_value=False):
+                    with patch.object(
+                        bot,
+                        "verify_order_result",
+                        side_effect=["timeout", "existing_order"],
+                    ) as verify_result:
+                        result = bot._submit_order_fast(submit_selectors)
 
         assert result == "existing_order"
-        assert verify_result.call_args_list == [call(timeout=1.2), call(timeout=2)]
+        # 已提交过一次后按钮消失：继续等结果，不再立刻放弃。
+        assert verify_result.call_args_list == [call(timeout=1.2), call(timeout=1.2)]
 
     def test_price_selection_text_match_success(self, bot):
         """Text-based price match works, index fallback not used."""
@@ -6042,15 +6093,66 @@ class TestRushPreSelectViaXml:
         title.assert_not_called()
         probe.assert_not_called()
 
-    def test_hot_submit_clicks_button_center_like_detail_buy(self, bot):
+    def test_sale_hot_path_skips_price_and_confirms_at_right_bottom(self, bot):
+        """正式抢票：默认已选档，跳过选票；确定用右下相对坐标。"""
+        bot.config.rush_mode = True
+        bot.config.if_commit_order = True
         bot._sale_hot_path = True
-        button = Mock()
-        button.info = {
-            "bounds": {"left": 666, "top": 2100, "right": 1000, "bottom": 2300}
-        }
-        with patch.object(bot, "_find", return_value=button):
-            with patch.object(bot, "_selector_exists", return_value=True):
-                with patch.object(bot, "_click_coordinates") as tap:
+        bot._screen_size = (1080, 2340)
+
+        with patch.object(bot, "dismiss_startup_popups"):
+            with patch.object(
+                bot,
+                "probe_current_page",
+                return_value={
+                    "state": "sku_page",
+                    "price_container": True,
+                    "reservation_mode": False,
+                    "quantity_picker": False,
+                    "submit_button": False,
+                },
+            ):
+                with patch.object(bot, "wait_for_sale_start"):
+                    with patch.object(bot, "_select_price_option") as select_price:
+                        with patch.object(
+                            bot, "_burst_click_coordinates"
+                        ) as burst_click:
+                            with patch.object(
+                                bot, "_wait_for_submit_ready", return_value=True
+                            ):
+                                with patch.object(
+                                    bot,
+                                    "_ensure_attendees_selected_on_confirm_page",
+                                    return_value=True,
+                                ):
+                                    with patch.object(
+                                        bot, "_submit_order_fast", return_value="success"
+                                    ):
+                                        with patch(
+                                            "mobile.damai_app.time"
+                                        ) as mock_time:
+                                            mock_time.time.side_effect = (
+                                                _make_time_side_effect(0.0, 0.9)
+                                            )
+                                            result = bot.run_ticket_grabbing()
+
+        assert result is True
+        select_price.assert_not_called()
+        burst_click.assert_called_with(
+            int(1080 * 0.78),
+            2240,
+            count=2,
+            interval_ms=25,
+            duration=25,
+        )
+
+    def test_hot_submit_clicks_right_bottom_relative_point(self, bot):
+        """热路径「立即提交」固定右下相对坐标，不查控件边界。"""
+        bot._sale_hot_path = True
+        bot._screen_size = (1080, 2340)
+        with patch.object(bot, "_click_submit_busy_retry_dialog", return_value=False):
+            with patch.object(bot, "_click_coordinates") as tap:
+                with patch.object(bot, "_find") as find_button:
                     with patch.object(
                         bot, "_verify_order_result_hot", return_value="success"
                     ):
@@ -6059,23 +6161,74 @@ class TestRushPreSelectViaXml:
                         )
 
         assert result == "success"
-        tap.assert_called_once_with(
-            (666 + 1000) // 2, (2100 + 2300) // 2, duration=25
-        )
+        tap.assert_called_once_with(int(1080 * 0.78), 2240, duration=25)
+        find_button.assert_not_called()
 
-    def test_hot_submit_clicks_bottom_point_without_title(self, bot):
+    def test_hot_submit_clicks_right_bottom_without_title(self, bot):
         bot._sale_hot_path = True
         bot._screen_size = (1080, 2340)
-        with patch.object(bot, "_click_coordinates") as tap:
-            with patch.object(bot, "ultra_fast_click") as text_click:
+        with patch.object(bot, "_click_submit_busy_retry_dialog", return_value=False):
+            with patch.object(bot, "_click_coordinates") as tap:
+                with patch.object(bot, "ultra_fast_click") as text_click:
+                    with patch.object(
+                        bot, "_verify_order_result_hot", return_value="success"
+                    ):
+                        result = bot._submit_order_fast([])
+
+        assert result == "success"
+        tap.assert_called_once_with(int(1080 * 0.78), 2240, duration=25)
+        text_click.assert_not_called()
+
+    def test_hot_submit_clicks_busy_retry_until_payment(self, bot):
+        """人数过多弹窗出现时连点「继续尝试」，直到进入支付页。"""
+        bot._sale_hot_path = True
+        bot._screen_size = (1080, 2340)
+        busy_clicks = {"n": 0}
+
+        def _busy_side_effect():
+            busy_clicks["n"] += 1
+            # 前两次模拟弹窗仍在，第三次起由 verify 返回 success。
+            return busy_clicks["n"] <= 2
+
+        with patch.object(
+            bot, "_click_submit_busy_retry_dialog", side_effect=_busy_side_effect
+        ) as busy:
+            with patch.object(bot, "_click_right_bottom_bar_point", return_value=True):
                 with patch.object(
-                    bot, "_verify_order_result_hot", return_value="success"
+                    bot,
+                    "_verify_order_result_hot",
+                    side_effect=["timeout", "timeout", "success"],
                 ):
                     result = bot._submit_order_fast([])
 
         assert result == "success"
-        tap.assert_called_once_with(540, 2240, duration=25)
-        text_click.assert_not_called()
+        assert busy.call_count == 3
+
+    def test_click_busy_retry_prefers_continue_not_reselect(self, bot):
+        """只点「继续尝试」，绝不点「返回重新选购」。"""
+        continue_btn = Mock()
+        continue_btn.info = {
+            "bounds": {"left": 200, "top": 1200, "right": 880, "bottom": 1350}
+        }
+
+        def _has(by, value):
+            return "继续尝试" in str(value)
+
+        with patch.object(bot, "_has_element", side_effect=_has):
+            with patch.object(bot, "_find", return_value=continue_btn):
+                with patch.object(bot, "_selector_exists", return_value=True):
+                    with patch.object(bot, "_click_coordinates") as tap:
+                        with patch.object(bot, "ultra_fast_click") as text_click:
+                            assert bot._click_submit_busy_retry_dialog() is True
+
+        tap.assert_called_once_with(
+            (200 + 880) // 2, (1200 + 1350) // 2, duration=25
+        )
+        # 不应走会误点文案的兜底路径
+        assert all(
+            "返回重新选购" not in str(c)
+            for c in text_click.call_args_list
+        )
 
     def test_hammer_clicks_bottom_button_without_hierarchy_dump(self, bot):
         bot._cached_hot_path_coords.pop("sku_buy", None)

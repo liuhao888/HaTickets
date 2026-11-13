@@ -11,6 +11,7 @@ sibling submodules: ``sale_waiter``, ``purchase_flow``,
 
 from __future__ import annotations
 
+import logging
 import re
 import sys
 import time
@@ -22,10 +23,10 @@ from selenium.webdriver.common.by import By
 
 try:
     from mobile.env_snapshot import detect_damai_app_version
-    from mobile.logger import log_event
+    from mobile.logger import log_event, log_step, log_wait
 except ImportError:  # pragma: no cover
     from env_snapshot import detect_damai_app_version  # type: ignore[no-redef]
-    from logger import log_event  # type: ignore[no-redef]
+    from logger import log_event, log_step, log_wait  # type: ignore[no-redef]
 
 from . import (
     ANDROID_UIAUTOMATOR,
@@ -74,6 +75,7 @@ class DamaiBot(
         # 供运行摘要 attempts 字段消费；纯整数自增，零热路径开销。
         self._attempts_made = 0
         self._last_discovery_step_timings = []
+        self._last_run_step_timings = []
         # Cache of {key: (x, y)} coordinates for hot-path elements.
         # Populated on the first run and reused on warm retries (1 HTTP call vs 4+).
         self._cached_hot_path_coords: dict = {}
@@ -297,33 +299,78 @@ class DamaiBot(
 
     @contextmanager
     def _timed_step(self, step_name, manual_baseline_seconds=None):
-        """Record and log per-step latency for discovery hot path."""
+        """Record and log per-step latency for discovery / commit hot path."""
         start = time.perf_counter()
         try:
             yield
         finally:
             elapsed = time.perf_counter() - start
+            duration_ms = int(elapsed * 1000)
             faster_than_manual = (
                 True
                 if manual_baseline_seconds is None
                 else elapsed <= manual_baseline_seconds
             )
-            self._last_discovery_step_timings.append(
-                {
-                    "step": step_name,
-                    "seconds": round(elapsed, 3),
-                    "manual_baseline_seconds": manual_baseline_seconds,
-                    "faster_than_manual": faster_than_manual,
-                }
+            entry = {
+                "step": step_name,
+                "seconds": round(elapsed, 3),
+                "duration_ms": duration_ms,
+                "manual_baseline_seconds": manual_baseline_seconds,
+                "faster_than_manual": faster_than_manual,
+            }
+            self._last_discovery_step_timings.append(entry)
+            self._last_run_step_timings.append(entry)
+            extra = {}
+            if manual_baseline_seconds is not None:
+                extra["manual_baseline_ms"] = int(manual_baseline_seconds * 1000)
+                extra["faster_than_manual"] = faster_than_manual
+            log_step(
+                logger,
+                step_name,
+                duration_ms=duration_ms,
+                level=logging.INFO
+                if faster_than_manual
+                else logging.WARNING,
+                **extra,
             )
-            if manual_baseline_seconds is None:
-                logger.info(f"步骤耗时[{step_name}] {elapsed:.2f}s")
-            else:
-                relation = "快于手动基线" if faster_than_manual else "慢于手动基线"
-                log_fn = logger.info if faster_than_manual else logger.warning
-                log_fn(
-                    f"步骤耗时[{step_name}] {elapsed:.2f}s（手动基线 {manual_baseline_seconds:.2f}s，{relation}）"
-                )
+
+    def _sleep_logged(self, seconds, kind):
+        """带日志的 sleep：记录计划等待与实际等待。"""
+        planned_ms = int(max(0.0, float(seconds)) * 1000)
+        if planned_ms <= 0:
+            log_wait(logger, kind=kind, waited_ms=0, planned_ms=0, skipped=True)
+            return
+        t0 = time.monotonic()
+        time.sleep(seconds)
+        log_wait(
+            logger,
+            kind=kind,
+            waited_ms=int((time.monotonic() - t0) * 1000),
+            planned_ms=planned_ms,
+        )
+
+    def _log_step_timing_summary(self):
+        """打印本轮主流程各步骤耗时汇总。"""
+        steps = getattr(self, "_last_run_step_timings", None) or []
+        if not steps:
+            return
+        total_ms = sum(int(item.get("duration_ms") or 0) for item in steps)
+        parts = [
+            f"{item.get('step')}={int(item.get('duration_ms') or 0)}ms" for item in steps
+        ]
+        logger.info(
+            "步骤耗时汇总 total=%dms steps=%d | %s",
+            total_ms,
+            len(steps),
+            " | ".join(parts),
+        )
+        log_event(
+            logger,
+            "step_timing_summary",
+            total_ms=total_ms,
+            steps=len(steps),
+            detail=";".join(parts),
+        )
 
     def _prepare_runtime_config(self):
         """Pre-flight config checks before creating the driver session."""
@@ -437,34 +484,61 @@ class DamaiBot(
 
     def _wait_for_submit_ready(self, timeout=1.6, poll_interval=0.04):
         """Wait until the confirm-page submit button appears."""
-        activity = self._get_current_activity() or ""
-        if "DmOrder" in activity:
-            return True
-        if self.config.rush_mode:
-            # 极速模式：单 ID 选择器轮询。订单页没有旧版 checkbox，每轮都看 Activity。
+        t0 = time.monotonic()
+        planned_ms = int(max(0.0, float(timeout)) * 1000)
+        ready = False
+        try:
+            activity = self._get_current_activity() or ""
+            if "DmOrder" in activity:
+                ready = True
+                return True
+            if self.config.rush_mode:
+                # 极速模式：单 ID 选择器轮询。订单页没有旧版 checkbox，每轮都看 Activity。
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    activity = self._get_current_activity() or ""
+                    if "DmOrder" in activity:
+                        ready = True
+                        return True
+                    if self._has_element(By.ID, "cn.damai:id/checkbox"):
+                        ready = True
+                        return True
+                    time.sleep(poll_interval)
+                return False
+
+            submit_selectors = [
+                (ANDROID_UIAUTOMATOR, 'new UiSelector().text("立即提交")'),
+                (
+                    ANDROID_UIAUTOMATOR,
+                    'new UiSelector().textMatches(".*提交.*|.*确认.*")',
+                ),
+                (By.XPATH, '//*[contains(@text,"提交")]'),
+            ]
+
             deadline = time.time() + timeout
             while time.time() < deadline:
-                activity = self._get_current_activity() or ""
-                if "DmOrder" in activity:
-                    return True
-                if self._has_element(By.ID, "cn.damai:id/checkbox"):
+                if self._has_any_element(submit_selectors):
+                    ready = True
                     return True
                 time.sleep(poll_interval)
+
             return False
-
-        submit_selectors = [
-            (ANDROID_UIAUTOMATOR, 'new UiSelector().text("立即提交")'),
-            (ANDROID_UIAUTOMATOR, 'new UiSelector().textMatches(".*提交.*|.*确认.*")'),
-            (By.XPATH, '//*[contains(@text,"提交")]'),
-        ]
-
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self._has_any_element(submit_selectors):
-                return True
-            time.sleep(poll_interval)
-
-        return False
+        finally:
+            waited_ms = int((time.monotonic() - t0) * 1000)
+            # 确认循环里短轮询很密，短等待降到 DEBUG，避免刷屏。
+            wait_level = (
+                logging.DEBUG
+                if ready and waited_ms < 50 and planned_ms < 200
+                else logging.INFO
+            )
+            log_wait(
+                logger,
+                kind="submit_ready",
+                waited_ms=waited_ms,
+                planned_ms=planned_ms,
+                ready=ready,
+                level=wait_level,
+            )
 
     def _click_sku_buy_button_element(self, burst_count=1):
         """点票档页右侧「确定」。与详情页「立即预订」一样只走坐标点击。"""
@@ -767,6 +841,11 @@ class DamaiBot(
                     logger.info("订单提交成功，检测到支付页关键控件")
                     return "success"
 
+            # 人数过多弹窗：点「继续尝试」后继续等支付页，不要点「返回重新选购」。
+            if self._click_submit_busy_retry_dialog():
+                logger.info("订单验证中检测到人数过多弹窗，已点击继续尝试")
+                continue
+
             time.sleep(0.3)
 
         logger.warning("订单验证超时")
@@ -972,8 +1051,10 @@ class DamaiBot(
             self._last_run_outcome = None
             self._session_list_logged = False
             self._visible_price_options = None
+            self._last_run_step_timings = []
             self._log_execution_mode()
-            page_probe = initial_page_probe or self.probe_current_page(fast=True)
+            with self._timed_step("probe_current_page"):
+                page_probe = initial_page_probe or self.probe_current_page(fast=True)
             validation_shortcut = self._uses_validation_shortcuts()
             fast_validation_hot_path = (
                 validation_shortcut
@@ -1060,19 +1141,23 @@ class DamaiBot(
             self._sale_hot_path = bool(
                 self.config.rush_mode and self._trust_page_defaults()
             )
-            self.wait_for_sale_start()
+            with self._timed_step("wait_for_sale_start"):
+                self.wait_for_sale_start()
             # 开售时间已过时再做一次全量探测，只会在详情页上多等几秒。
             if not (self.config.rush_mode and self._trust_page_defaults()) and (
                 self.config.sell_start_time is not None or not self.config.rush_mode
             ):
-                page_probe = self.probe_current_page()
+                with self._timed_step("probe_after_sale_wait"):
+                    page_probe = self.probe_current_page()
 
             if page_probe["state"] == "detail_page":
-                page_probe = self._enter_purchase_flow_from_detail_page(
-                    prepared=prepared_detail_page
-                )
+                with self._timed_step("enter_purchase_from_detail"):
+                    page_probe = self._enter_purchase_flow_from_detail_page(
+                        prepared=prepared_detail_page
+                    )
                 if page_probe is None or page_probe.get("state") == "detail_page":
                     logger.info("点击后仍在详情页，本次不选票价")
+                    self._log_step_timing_summary()
                     return False
                 if self._trust_page_defaults():
                     logger.info("使用页面默认场次，不核对日期")
@@ -1084,9 +1169,10 @@ class DamaiBot(
                 elif validation_shortcut and self.config.rush_mode:
                     logger.info("开发验证极速路径：已在票档页，跳过场次切换")
                 else:
-                    self._ensure_performance_date_selected(
-                        max_wait=2.0 if self.config.rush_mode else 3.0
-                    )
+                    with self._timed_step("ensure_performance_date"):
+                        self._ensure_performance_date_selected(
+                            max_wait=2.0 if self.config.rush_mode else 3.0
+                        )
             if self.config.rush_mode:
                 # 极速模式下避免一次完整重探测，减少热路径阻塞。
                 # 预约不在这里连打选择器，交给下面同一次界面树判断。
@@ -1121,6 +1207,9 @@ class DamaiBot(
             if getattr(self, "_sale_hot_path", False) and page_probe.get("state") == "sku_page":
                 # 正式抢票不把票档页当成预约页。底部右侧是「确定」，不是预约按钮。
                 page_probe["reservation_mode"] = False
+                # 固定右下相对坐标，不查 btn_buy_view（查找常耗 0.5–1s）。
+                if buy_button_coords is None:
+                    buy_button_coords = self._right_bottom_bar_point()
             elif self.config.rush_mode and page_probe["state"] == "sku_page":
                 if (
                     price_coords is None
@@ -1181,8 +1270,8 @@ class DamaiBot(
                     xml_root=_sku_xml if self.config.rush_mode else None
                 )
 
-            # 3. 票价选择 - 优化查找逻辑
-            skip_price_selection = (
+            # 3. 票价选择 - 热路径进入时默认已勾选，直接点确定下单。
+            skip_price_selection = getattr(self, "_sale_hot_path", False) or (
                 validation_shortcut
                 and self.config.rush_mode
                 and self._has_element(By.ID, "layout_num")
@@ -1190,18 +1279,32 @@ class DamaiBot(
             if reservation_reached_confirm:
                 logger.info("预约页底部按钮已进入确认页，跳过票档点击")
             elif skip_price_selection:
-                logger.info("开发验证极速路径：检测到已处于可调数量状态，跳过票档点击")
+                if getattr(self, "_sale_hot_path", False):
+                    logger.info("热路径：票档页已默认勾选，跳过选票直接下单")
+                    log_event(
+                        logger,
+                        "click_strategy",
+                        action="select_price",
+                        strategy="skip_default_selected",
+                    )
+                else:
+                    logger.info(
+                        "开发验证极速路径：检测到已处于可调数量状态，跳过票档点击"
+                    )
             else:
                 logger.info("选择票价...")
                 try:
-                    selected = self._select_price_option(cached_coords=price_coords)
+                    with self._timed_step("select_price"):
+                        selected = self._select_price_option(cached_coords=price_coords)
                 except SoldOutError as exc:
                     self._save_price_failure_dump(reason=f"sold_out: {exc}")
                     logger.error("票档已售罄，停止本轮抢票: %s", exc)
+                    self._log_step_timing_summary()
                     return False
                 except PriceSelectorError as exc:
                     self._save_price_failure_dump(reason=str(exc))
                     logger.error("价格选择失败: %s", exc)
+                    self._log_step_timing_summary()
                     return False
                 if not selected:
                     if getattr(self, "_hot_path_reservation", False):
@@ -1214,13 +1317,15 @@ class DamaiBot(
                             selected = True
                     if not selected:
                         self._save_price_failure_dump(reason="select returned False")
+                        self._log_step_timing_summary()
                         return False
 
             # 4. 数量选择
             if not reservation_reached_confirm:
                 logger.info("选择数量...")
                 if len(self.config.users) > 1:
-                    self._adjust_quantity_to_user_count()
+                    with self._timed_step("adjust_quantity"):
+                        self._adjust_quantity_to_user_count()
 
             # 5. 确定购买 — brief wait for price selection to register.
             # Damai App ignores confirm clicks until btn_buy_view becomes clickable (price > 0).
@@ -1232,24 +1337,63 @@ class DamaiBot(
             else:
                 hot = getattr(self, "_sale_hot_path", False)
                 if not hot:
-                    time.sleep(0.1 if self.config.rush_mode else 0.5)
+                    self._sleep_logged(
+                        0.1 if self.config.rush_mode else 0.5,
+                        "price_register_before_confirm",
+                    )
                 logger.info("确定购买...")
                 submit_ready = False
+                # 正式抢票热路径也要给页面跳转留窗口；0.28s 在慢机/弱网会未进确认页就失败。
                 confirm_deadline = time.time() + (
-                    0.28 if hot else (4.0 if self.config.rush_mode else 1.8)
+                    1.5 if hot else (4.0 if self.config.rush_mode else 1.8)
                 )
             confirm_attempt = 0
             # probe 与 commit 同为 2 连击；只有开发验证捷径降为 1 次。
             burst_count = 1 if validation_shortcut else 2
+            confirm_t0 = time.perf_counter()
             while time.time() < confirm_deadline and not submit_ready:
                 confirm_attempt += 1
-                if self.config.rush_mode and buy_button_coords:
+                if getattr(self, "_sale_hot_path", False):
+                    # 票档页右侧「确定」：固定相对坐标，不查控件。
+                    point = buy_button_coords or self._right_bottom_bar_point()
+                    if point is not None:
+                        self._burst_click_coordinates(
+                            *point,
+                            count=burst_count,
+                            interval_ms=25,
+                            duration=25,
+                        )
+                        buy_button_coords = point
+                        log_event(
+                            logger,
+                            "click_strategy",
+                            action="sku_confirm",
+                            strategy="right_bottom_bar_point",
+                            attempt=confirm_attempt,
+                        )
+                    else:
+                        self._click_sku_buy_button_element(burst_count=burst_count)
+                        log_event(
+                            logger,
+                            "click_strategy",
+                            action="sku_confirm",
+                            strategy="btn_buy_element_coords",
+                            attempt=confirm_attempt,
+                        )
+                elif self.config.rush_mode and buy_button_coords:
                     if confirm_attempt == 1:
                         self._burst_click_coordinates(
                             *buy_button_coords,
                             count=burst_count,
                             interval_ms=25,
                             duration=25,
+                        )
+                        log_event(
+                            logger,
+                            "click_strategy",
+                            action="sku_confirm",
+                            strategy="cached_buy_coords",
+                            attempt=confirm_attempt,
                         )
                     else:
                         if not self._click_sku_buy_button_element(
@@ -1261,9 +1405,21 @@ class DamaiBot(
                                 interval_ms=25,
                                 duration=25,
                             )
-                elif getattr(self, "_sale_hot_path", False):
-                    # 票档页右侧「确定」。不能点屏幕正中，那一块是价格明细，不是确认按钮。
-                    self._click_sku_buy_button_element(burst_count=burst_count)
+                            log_event(
+                                logger,
+                                "click_strategy",
+                                action="sku_confirm",
+                                strategy="cached_buy_coords_retry",
+                                attempt=confirm_attempt,
+                            )
+                        else:
+                            log_event(
+                                logger,
+                                "click_strategy",
+                                action="sku_confirm",
+                                strategy="btn_buy_element_coords",
+                                attempt=confirm_attempt,
+                            )
                 elif self.config.rush_mode:
                     # Element click may not work on Damai's custom btn_buy_view —
                     # use coordinate click from XML bounds as primary method.
@@ -1297,7 +1453,7 @@ class DamaiBot(
                         )
                 # Short wait then check if confirm page appeared
                 remaining = confirm_deadline - time.time()
-                check_cap = 0.16 if getattr(self, "_sale_hot_path", False) else 1.0
+                check_cap = 0.35 if getattr(self, "_sale_hot_path", False) else 1.0
                 check_timeout = min(check_cap, max(0.08, remaining))
                 submit_ready = self._wait_for_submit_ready(
                     timeout=check_timeout,
@@ -1312,7 +1468,26 @@ class DamaiBot(
                             "购买按钮区域检测到缺货/售罄标识，该票档当前不可购买"
                         )
                         self._set_terminal_failure("sold_out")
+                        self._log_step_timing_summary()
                         return False
+            confirm_elapsed = time.perf_counter() - confirm_t0
+            confirm_ms = int(confirm_elapsed * 1000)
+            log_step(
+                logger,
+                "confirm_purchase",
+                duration_ms=confirm_ms,
+                attempts=confirm_attempt,
+                submit_ready=submit_ready,
+            )
+            self._last_run_step_timings.append(
+                {
+                    "step": "confirm_purchase",
+                    "seconds": round(confirm_elapsed, 3),
+                    "duration_ms": confirm_ms,
+                    "manual_baseline_seconds": None,
+                    "faster_than_manual": True,
+                }
+            )
             if not submit_ready:
                 if self._trust_page_defaults():
                     logger.info("使用页面默认观演人，不按姓名查找")
@@ -1343,6 +1518,7 @@ class DamaiBot(
                 validation_shortcut and self.config.rush_mode
             ):
                 logger.warning("未进入订单确认页，请检查票档可用性或观演人配置")
+                self._log_step_timing_summary()
                 return False
 
             submit_selectors = [
@@ -1357,14 +1533,16 @@ class DamaiBot(
                 logger.info("使用页面默认观演人，不按姓名勾选")
                 attendees_ready = True
             else:
-                attendees_ready = self._ensure_attendees_selected_on_confirm_page(
-                    require_attendee_section=validation_shortcut
-                    and self.config.rush_mode
-                )
-                self._log_visible_attendees()
+                with self._timed_step("select_attendees"):
+                    attendees_ready = self._ensure_attendees_selected_on_confirm_page(
+                        require_attendee_section=validation_shortcut
+                        and self.config.rush_mode
+                    )
+                    self._log_visible_attendees()
             if not attendees_ready:
                 self._set_terminal_failure("attendee_unselected")
                 logger.error("订单提交前观演人未选择完整，已停止自动提交")
+                self._log_step_timing_summary()
                 return False
 
             if not self._should_submit_order():
@@ -1385,12 +1563,16 @@ class DamaiBot(
                     logger.info(
                         f"已到订单确认页且观演人已勾选，未提交订单（开发验证），耗时: {end_time - start_time:.2f}秒"
                     )
+                self._log_step_timing_summary()
                 return True
 
             # 7. 提交订单
             logger.info("提交订单...")
-            result = self._submit_order_fast(submit_selectors)
-            return self._finalize_submit_result(result, start_time=start_time)
+            with self._timed_step("submit_order"):
+                result = self._submit_order_fast(submit_selectors)
+            finalized = self._finalize_submit_result(result, start_time=start_time)
+            self._log_step_timing_summary()
+            return finalized
 
         except Exception as e:
             logger.error(f"抢票过程发生错误: {e}")
@@ -1400,6 +1582,7 @@ class DamaiBot(
                 capture_failure_artifacts(self, "run_ticket_grabbing", error=e)
             except Exception:  # pragma: no cover — failure capture must not crash
                 logger.debug("failure artifact capture failed", exc_info=True)
+            self._log_step_timing_summary()
             return False
         finally:
             time.sleep(0.05)

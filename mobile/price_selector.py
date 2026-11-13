@@ -7,6 +7,7 @@ providing a clean interface for FastPipeline and other consumers.
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import os
 import re
 import shutil
@@ -23,7 +24,7 @@ from selenium.webdriver.common.by import By
 from mobile.ui_primitives import ANDROID_UIAUTOMATOR
 from selenium.webdriver.support import expected_conditions as EC
 
-from mobile.logger import get_logger
+from mobile.logger import get_logger, log_strategy
 
 try:
     from mobile.item_resolver import normalize_text
@@ -713,6 +714,9 @@ class PriceSelector:
                         and child.get("clickable") == "true"
                     ]
                     if not cards:
+                        # 新版票档可能是可点击 ViewGroup，不再是 FrameLayout。
+                        cards = flow_item_cards(node)
+                    if not cards:
                         continue
                     matched = self._match_price_card_from_xml(cards)
                     if matched is not None:
@@ -850,8 +854,11 @@ class PriceSelector:
 
         clickable_cards = [card for card in cards if bot._is_clickable(card)]
         if 0 <= card_index < len(clickable_cards):
-            bot._click_element_center(clickable_cards[card_index], duration=30)
-            return True
+            return bool(
+                bot._tap_element_center_coordinates(
+                    clickable_cards[card_index], duration=25
+                )
+            )
         return False
 
     def _click_price_option_by_config_index(self, burst=False, coords=None):
@@ -861,26 +868,63 @@ class PriceSelector:
         clickable 经常为 false，节点 click() 点不中。
         """
         bot = self._bot
+        t0 = time.monotonic()
         if coords:
             self._tap_point(coords, burst=burst)
+            log_strategy(
+                logger,
+                action="select_price",
+                strategy="cached_index_coords",
+                price_index=self._config.price_index,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+            )
             logger.info(
                 f"通过配置索引直接选择票价: price_index={self._config.price_index}"
             )
             return True
         if self._click_price_card_element(self._config.price_index, burst=burst):
+            log_strategy(
+                logger,
+                action="select_price",
+                strategy="index_element_coords",
+                price_index=self._config.price_index,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+            )
             logger.info(
                 f"通过配置索引直接选择票价: price_index={self._config.price_index}"
             )
             return True
         if self._footer_price_matches_target():
+            log_strategy(
+                logger,
+                action="select_price",
+                strategy="footer_already_selected",
+                price=self._config.price,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+            )
             logger.info(
                 "底部价格已是目标票档 %s，跳过票档点击", self._config.price
             )
             return True
         target_coords = bot._get_price_option_coordinates_by_config_index()
         if not target_coords:
+            log_strategy(
+                logger,
+                action="select_price",
+                strategy="index_coords_miss",
+                price_index=self._config.price_index,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                level=logging.WARNING,
+            )
             return False
         self._tap_point(target_coords, burst=burst)
+        log_strategy(
+            logger,
+            action="select_price",
+            strategy="xml_index_coords",
+            price_index=self._config.price_index,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+        )
         logger.info(f"通过配置索引直接选择票价: price_index={self._config.price_index}")
         return True
 
@@ -1009,7 +1053,11 @@ class PriceSelector:
                 burst=True, coords=cached_coords
             ):
                 return True
-            return False
+            # 索引/缓存点不中时，继续走下方票价文本匹配，避免直接 select returned False。
+            logger.warning(
+                "正式抢票索引选票失败 (price_index=%s)，改用票价文本匹配",
+                self._config.price_index,
+            )
         if self._config.rush_mode:
             # 先按票价数字匹配（780 即可命中「内场780元」）。
             # price_index 只在名称还没识别出来时兜底，不能拿缺货的第 0 档挡住 780。
@@ -1048,6 +1096,13 @@ class PriceSelector:
                     )
                     return False
                 if self._tap_price_option(option, burst=_burst):
+                    log_strategy(
+                        logger,
+                        action="select_price",
+                        strategy="text_match",
+                        price=self._config.price,
+                        matched=option.get("text") or "",
+                    )
                     logger.info(
                         "通过票价匹配选择: %s (配置 %s)",
                         option.get("text") or self._config.price,
@@ -1082,6 +1137,13 @@ class PriceSelector:
                 return False
             if indexed and indexed.get("bounds"):
                 if self._tap_price_option(indexed, burst=_burst):
+                    log_strategy(
+                        logger,
+                        action="select_price",
+                        strategy="visible_index_coords",
+                        price_index=self._config.price_index,
+                        matched=label or self._config.price,
+                    )
                     logger.info(
                         "通过票档坐标选择: %s (price_index=%s)",
                         label or self._config.price,
@@ -1280,8 +1342,9 @@ class PriceSelector:
                         )
                     return False
                 target_price = clickable_cards[self._config.price_index]
-            bot._click_element_center(target_price, duration=30)
-            return True
+            return bool(
+                bot._tap_element_center_coordinates(target_price, duration=25)
+            )
         except Exception as e:
             logger.warning(f"票价选择失败，启动备用方案: {e}")
             try:
@@ -1318,8 +1381,9 @@ class PriceSelector:
                         )
                         return False
                     target_price = clickable_cards[self._config.price_index]
-                bot._click_element_center(target_price, duration=30)
-                return True
+                return bool(
+                    bot._tap_element_center_coordinates(target_price, duration=25)
+                )
             except Exception as backup_error:
                 logger.warning(f"备用票价选择也失败: {backup_error}")
                 return False

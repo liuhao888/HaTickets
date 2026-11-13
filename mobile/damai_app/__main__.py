@@ -33,6 +33,15 @@ from .run_report import (
     write_run_summary,
 )
 
+try:
+    from mobile.logger import finish_run_session, get_run_log_path, start_run_session
+except ImportError:  # pragma: no cover
+    from logger import (  # type: ignore[no-redef]
+        finish_run_session,
+        get_run_log_path,
+        start_run_session,
+    )
+
 
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(prog="damai_app")
@@ -84,7 +93,10 @@ def main(argv=None) -> int:
     exit_code = EXIT_CONFIG_OR_DEVICE_ERROR
     outcome = "config_or_device_error"
     terminal_reason = None
+    run_log_path = None
     try:
+        run_log_path = start_run_session()
+        logger.info("本次执行详细日志: %s", run_log_path)
         try:
             bot = DamaiBot()
         except KeyboardInterrupt:
@@ -130,23 +142,36 @@ def main(argv=None) -> int:
             # 初始化失败时从环境变量兜底（--serial 已写入 / 脚本已 export）
             serial = os.environ.get(SERIAL_OVERRIDE_ENV_VAR, "").strip() or None
             mode = None
-        write_run_summary(
-            result_path,
-            {
-                "schema_version": RUN_SUMMARY_SCHEMA_VERSION,
-                "outcome": outcome,
-                "exit_code": exit_code,
-                "serial": serial,
-                "mode": mode,
-                "attempts": _safe(
-                    lambda: int(getattr(bot, "_attempts_made", 0) or 0), 0
-                ),
-                "duration_ms": int((time.monotonic() - t0) * 1000),
-                "terminal_reason": terminal_reason,
-                "started_at": started_at,
-                "finished_at": datetime.now().astimezone().isoformat(),
-            },
-        )
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        summary = {
+            "schema_version": RUN_SUMMARY_SCHEMA_VERSION,
+            "outcome": outcome,
+            "exit_code": exit_code,
+            "serial": serial,
+            "mode": mode,
+            "attempts": _safe(
+                lambda: int(getattr(bot, "_attempts_made", 0) or 0), 0
+            ),
+            "duration_ms": duration_ms,
+            "terminal_reason": terminal_reason,
+            "started_at": started_at,
+            "finished_at": datetime.now().astimezone().isoformat(),
+            "run_log": str(get_run_log_path() or run_log_path or ""),
+        }
+        write_run_summary(result_path, summary)
+        try:
+            finish_run_session(
+                outcome=outcome,
+                exit_code=exit_code,
+                terminal_reason=terminal_reason,
+                extra={
+                    "mode": mode,
+                    "attempts": summary["attempts"],
+                    "serial": serial,
+                },
+            )
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

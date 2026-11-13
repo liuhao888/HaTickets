@@ -9,8 +9,14 @@ from mobile.logger import (
     _ShanghaiColorFormatter,
     _ShanghaiFormatter,
     _supports_color,
+    finish_run_session,
     get_logger,
+    get_run_log_path,
     log_event,
+    log_step,
+    log_strategy,
+    log_wait,
+    start_run_session,
     _ANSI_COLORS,
     _ANSI_RESET,
     _DATE_FORMAT,
@@ -311,3 +317,86 @@ class TestLogEvent:
         msg = captured[0][1]
         # Order: event → date → city → index
         assert msg.index("date=") < msg.index("city=") < msg.index("index=")
+
+
+# ---------------------------------------------------------------------------
+# run session log (log/YYYYMMDD_HHMMSS.log)
+# ---------------------------------------------------------------------------
+
+
+class TestRunSessionLog:
+    def test_start_creates_timestamped_file(self, tmp_path):
+        path = start_run_session(log_dir=tmp_path, stamp="20261107_150322")
+        try:
+            assert path == tmp_path / "20261107_150322.log"
+            assert path.exists()
+            assert get_run_log_path() == path
+            lgr = get_logger("test_run_session_write")
+            log_strategy(
+                lgr,
+                action="select_price",
+                strategy="index_coords",
+                price_index=0,
+                duration_ms=12,
+            )
+            lgr.error("模拟报错内容")
+        finally:
+            finished = finish_run_session(outcome="success", exit_code=0)
+
+        assert finished == path
+        assert get_run_log_path() is None
+        text = path.read_text(encoding="utf-8")
+        assert "run session start" in text
+        assert "event=click_strategy" in text
+        assert "strategy=index_coords" in text
+        assert "模拟报错内容" in text
+        assert "outcome=success" in text
+        assert "duration_ms=" in text
+
+    def test_log_strategy_emits_click_strategy_event(self):
+        lgr = logging.getLogger("test_log_strategy_only")
+        lgr.handlers.clear()
+        lgr.setLevel(logging.DEBUG)
+        lgr.propagate = False
+        captured = []
+
+        class CaptureHandler(logging.Handler):
+            def emit(self, record):
+                captured.append(record.getMessage())
+
+        lgr.addHandler(CaptureHandler())
+        log_strategy(
+            lgr,
+            action="submit_order",
+            strategy="labeled_button_coords",
+            attempt=1,
+        )
+        assert captured
+        assert "event=click_strategy" in captured[0]
+        assert "action=submit_order" in captured[0]
+        assert "strategy=labeled_button_coords" in captured[0]
+
+    def test_log_step_and_wait(self):
+        lgr = logging.getLogger("test_log_step_wait")
+        lgr.handlers.clear()
+        lgr.setLevel(logging.DEBUG)
+        lgr.propagate = False
+        captured = []
+
+        class CaptureHandler(logging.Handler):
+            def emit(self, record):
+                captured.append(record.getMessage())
+
+        lgr.addHandler(CaptureHandler())
+        log_step(lgr, "select_price", duration_ms=123)
+        log_wait(
+            lgr,
+            kind="countdown_sleep",
+            waited_ms=3000,
+            planned_ms=3000,
+        )
+        joined = "\n".join(captured)
+        assert "event=step_timing" in joined
+        assert "步骤耗时[select_price] 0.12s" in joined
+        assert "event=wait" in joined
+        assert "等待耗时[countdown_sleep] waited=3000ms planned=3000ms" in joined

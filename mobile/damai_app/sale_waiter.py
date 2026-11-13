@@ -21,9 +21,9 @@ from . import (
 )
 
 try:
-    from mobile.logger import log_event
+    from mobile.logger import log_event, log_wait
 except ImportError:  # pragma: no cover
-    from logger import log_event  # type: ignore[no-redef]
+    from logger import log_event, log_wait  # type: ignore[no-redef]
 
 try:
     from mobile.item_resolver import normalize_text
@@ -126,6 +126,13 @@ class SaleWaiterMixin:
         now = datetime.now(tz=_tz_shanghai)
         if now >= sell_time:
             logger.info("开售时间已过，跳过等待")
+            log_wait(
+                logger,
+                kind="countdown_skip",
+                waited_ms=0,
+                planned_ms=0,
+                reason="sell_start_already_passed",
+            )
             return
 
         lead_delta = timedelta(milliseconds=self.config.countdown_lead_ms)
@@ -133,11 +140,20 @@ class SaleWaiterMixin:
         sleep_seconds = (poll_start - now).total_seconds()
 
         if sleep_seconds > 0:
+            planned_ms = int(sleep_seconds * 1000)
             logger.info(
                 f"等待开售，将在 {self.config.sell_start_time} 前 "
-                f"{self.config.countdown_lead_ms}ms 开始轮询"
+                f"{self.config.countdown_lead_ms}ms 开始轮询（计划休眠 {planned_ms}ms）"
             )
+            sleep_t0 = time.monotonic()
             time.sleep(sleep_seconds)
+            log_wait(
+                logger,
+                kind="countdown_sleep",
+                waited_ms=int((time.monotonic() - sleep_t0) * 1000),
+                planned_ms=planned_ms,
+                lead_ms=self.config.countdown_lead_ms,
+            )
 
         logger.info(
             "距开售 %dms，开始高频轮询",
@@ -145,7 +161,7 @@ class SaleWaiterMixin:
         )
 
         # 倒计时结束前 150ms 就点进场次页。坐标在开售前已经量过，到点不再读按钮。
-        click_at = sell_time - timedelta(milliseconds=150)
+        click_at = sell_time - timedelta(milliseconds=500)
 
         # 交错轮询循环（issue #41）：每轮依次做「guard 文案读取（廉价）→ Canvas
         # 坐标兜底 → 页面结构多信号兜底」。旧实现先串行烧 guard.wait_until_safe
@@ -191,12 +207,21 @@ class SaleWaiterMixin:
                         int(coords[1]),
                     )
                     logger.info("距开售 150ms，点击进入场次页")
+                    poll_waited_ms = int((time.monotonic() - loop_t0) * 1000)
+                    log_wait(
+                        logger,
+                        kind="countdown_poll",
+                        waited_ms=poll_waited_ms,
+                        planned_ms=self.config.countdown_lead_ms,
+                        polls=polls,
+                        result="canvas_early_click",
+                    )
                     log_event(
                         logger,
                         "cta_canvas_fallback",
                         resource_id=guard._last_matched_resource_id,
                         coords=coords,
-                        waited_ms=int((time.monotonic() - loop_t0) * 1000),
+                        waited_ms=poll_waited_ms,
                         polls=polls,
                     )
                     return
@@ -208,13 +233,22 @@ class SaleWaiterMixin:
             if text:
                 saw_cta_text = True
                 if guard.is_safe_to_click(text):
+                    poll_waited_ms = int((time.monotonic() - loop_t0) * 1000)
+                    log_wait(
+                        logger,
+                        kind="countdown_poll",
+                        waited_ms=poll_waited_ms,
+                        planned_ms=self.config.countdown_lead_ms,
+                        polls=polls,
+                        result="sale_ready_text",
+                    )
                     log_event(
                         logger,
                         "sale_ready",
                         source="buy_button_guard",
                         cta_text=text,
                         polls=polls,
-                        duration_ms=int((time.monotonic() - loop_t0) * 1000),
+                        duration_ms=poll_waited_ms,
                     )
                     return
 
@@ -230,12 +264,21 @@ class SaleWaiterMixin:
                         int(coords[0]),
                         int(coords[1]),
                     )
+                    poll_waited_ms = int((time.monotonic() - loop_t0) * 1000)
+                    log_wait(
+                        logger,
+                        kind="countdown_poll",
+                        waited_ms=poll_waited_ms,
+                        planned_ms=self.config.countdown_lead_ms,
+                        polls=polls,
+                        result="canvas_fallback",
+                    )
                     log_event(
                         logger,
                         "cta_canvas_fallback",
                         resource_id=guard._last_matched_resource_id,
                         coords=coords,
-                        waited_ms=int((time.monotonic() - loop_t0) * 1000),
+                        waited_ms=poll_waited_ms,
                         polls=polls,
                     )
                     return
@@ -243,21 +286,40 @@ class SaleWaiterMixin:
             # (3) 老版页面结构兜底：多购买信号文案轮询（行为不变）。
             if self._is_sale_ready():
                 cta_text = getattr(self, "_last_sale_ready_text", None) or "?"
+                poll_waited_ms = int((time.monotonic() - loop_t0) * 1000)
+                log_wait(
+                    logger,
+                    kind="countdown_poll",
+                    waited_ms=poll_waited_ms,
+                    planned_ms=self.config.countdown_lead_ms,
+                    polls=polls,
+                    result="sale_ready_structure",
+                )
                 log_event(
                     logger,
                     "sale_ready",
                     source="poll_loop",
                     cta_text=cta_text,
                     polls=polls,
-                    duration_ms=int((time.monotonic() - loop_t0) * 1000),
+                    duration_ms=poll_waited_ms,
                 )
                 return
             time.sleep(0.05)
 
+        poll_waited_ms = int((time.monotonic() - loop_t0) * 1000)
+        log_wait(
+            logger,
+            kind="countdown_poll",
+            waited_ms=poll_waited_ms,
+            planned_ms=int(self.config.countdown_lead_ms) + 8000,
+            polls=polls,
+            result="timeout",
+            level=logging.WARNING,
+        )
         log_event(
             logger,
             "sale_wait_timeout",
             level=logging.WARNING,
             polls=polls,
-            duration_ms=int((time.monotonic() - loop_t0) * 1000),
+            duration_ms=poll_waited_ms,
         )

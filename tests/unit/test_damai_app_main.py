@@ -38,6 +38,7 @@ SUMMARY_KEYS = {
     "terminal_reason",
     "started_at",
     "finished_at",
+    "run_log",
 }
 
 
@@ -70,6 +71,14 @@ def _make_fake_bot(
 def _isolate_cwd(tmp_path, monkeypatch):
     """默认摘要路径相对 cwd——所有用例 chdir 到 tmp_path，避免污染仓库。"""
     monkeypatch.chdir(tmp_path)
+    # 会话日志也落到 tmp，避免测试往仓库 log/ 写文件。
+    real_start = main_mod.start_run_session
+
+    def _start_in_tmp(*args, **kwargs):
+        kwargs.setdefault("log_dir", tmp_path / "log")
+        return real_start(*args, **kwargs)
+
+    monkeypatch.setattr(main_mod, "start_run_session", _start_in_tmp)
 
 
 def _read_summary(path):

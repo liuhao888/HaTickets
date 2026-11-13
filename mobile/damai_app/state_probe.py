@@ -72,19 +72,34 @@ class StateProbeMixin:
 
         return any(self._has_element(by, value) for by, value in reservation_indicators)
 
-    def _bottom_bar_point(self):
-        """详情页购票栏和票档页底部按钮都盖住这块区域。不读控件边界。"""
+    def _screen_size_tuple(self):
+        """缓存 window_size，供底部栏相对坐标复用。"""
         size = getattr(self, "_screen_size", None)
+        if size:
+            return size
+        try:
+            width, height = self.d.window_size()
+            size = (int(width), int(height))
+        except Exception:
+            return None
+        if size[0] <= 0 or size[1] <= 0:
+            return None
+        self._screen_size = size
+        return size
+
+    def _bottom_bar_point(self):
+        """详情页购票栏中部。不读控件边界。"""
+        size = self._screen_size_tuple()
         if not size:
-            try:
-                width, height = self.d.window_size()
-                size = (int(width), int(height))
-            except Exception:
-                return None
-            if size[0] <= 0 or size[1] <= 0:
-                return None
-            self._screen_size = size
+            return None
         return (size[0] // 2, size[1] - 100)
+
+    def _right_bottom_bar_point(self):
+        """票档「确定」/确认页「立即提交」偏右下。相对屏宽约 0.78，与 btn_buy_view 实测中心对齐。"""
+        size = self._screen_size_tuple()
+        if not size:
+            return None
+        return (int(size[0] * 0.78), size[1] - 100)
 
     def _sku_price_title(self):
         """读票档标题。直接取文字，不走会再等一遍控件出现的 get_text。"""
@@ -360,8 +375,15 @@ class StateProbeMixin:
         )
         quantity_picker = self._has_element(By.ID, "layout_num")
         submit_button = self._has_element(By.ID, "cn.damai:id/checkbox")
-        pending_order_dialog = self._has_element(
-            By.ID, "cn.damai:id/damai_theme_dialog_confirm_btn"
+        # 「继续尝试」也是 theme_dialog 确认钮，不能当成未支付订单弹窗。
+        busy_crowd_retry = self._has_element(
+            ANDROID_UIAUTOMATOR, 'new UiSelector().text("继续尝试")'
+        ) or self._has_element(
+            ANDROID_UIAUTOMATOR, 'new UiSelector().textContains("抢票人数太多")'
+        )
+        pending_order_dialog = (
+            self._has_element(By.ID, "cn.damai:id/damai_theme_dialog_confirm_btn")
+            and not busy_crowd_retry
         )
         reservation_mode = False
 
